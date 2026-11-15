@@ -1,11 +1,20 @@
 import _ from 'lodash';
+import fs from 'fs-extra';
 
 import Request from '@/lib/request/Request.ts';
+import Response from '@/lib/response/Response.ts';
 import { generateVideoWithRetry, DEFAULT_MODEL } from '@/api/controllers/videos.ts';
-import { generateDoubaoVideo, isDoubaoVideoModel } from '@/api/controllers/doubao-videos.ts';
+import { generateDoubaoVideo, isDoubaoVideoModel, resolveLocalVideoPath } from '@/api/controllers/doubao-videos.ts';
 import { executeWithCredentialFailover } from '@/api/controllers/auth.ts';
 import util from '@/lib/util.ts';
 import db from '@/lib/database.ts';
+
+function requestBaseOrigin(request: Request): string | undefined {
+    const host = request.headers?.['x-forwarded-host'] || request.headers?.host;
+    if (!host || typeof host !== 'string') return undefined;
+    const proto = (request.headers?.['x-forwarded-proto'] || 'http').split(',')[0].trim();
+    return `${proto}://${host.split(',')[0].trim()}`;
+}
 
 function appendUploadedPaths(value: any, target: string[]) {
     if (!value) return;
@@ -20,6 +29,31 @@ function appendUploadedPaths(value: any, target: string[]) {
 export default {
 
     prefix: '/v1/videos',
+
+    get: {
+
+        '/files/:filename': async (request: Request) => {
+            const filename = String(request.params?.filename || '');
+            const filePath = resolveLocalVideoPath(filename);
+            if (!filePath || !(await fs.pathExists(filePath))) {
+                return new Response({ error: '视频文件不存在' }, { statusCode: 404 });
+            }
+            const stat = await fs.stat(filePath);
+            const headers: Record<string, string> = {
+                'Accept-Ranges': 'bytes',
+                'Cache-Control': 'public, max-age=86400'
+            };
+            if (request.query?.download === '1') {
+                headers['Content-Disposition'] = `attachment; filename="${filename}"`;
+            }
+            return new Response(fs.createReadStream(filePath), {
+                type: 'video/mp4',
+                size: stat.size,
+                headers
+            });
+        }
+
+    },
 
     post: {
 
@@ -53,12 +87,13 @@ export default {
 
             const useDoubao = isDoubaoVideoModel(model);
             const provider = useDoubao ? 'doubao' : 'jimeng';
+            const baseOrigin = requestBaseOrigin(request);
 
             const { result: videoUrl, credential } = await executeWithCredentialFailover(
                 request.headers.authorization,
                 provider,
                 (cred) => useDoubao
-                    ? generateDoubaoVideo(model, prompt, { ratio, resolution, duration, filePaths }, cred.token)
+                    ? generateDoubaoVideo(model, prompt, { ratio, resolution, duration, filePaths, baseOrigin }, cred.token)
                     : generateVideoWithRetry(model, prompt, { ratio, resolution, duration, filePaths }, cred.token)
             );
 

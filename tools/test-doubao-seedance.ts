@@ -29,7 +29,11 @@ async function main() {
     isVideoConfirmCard,
     parseAbilityAck,
     resolveDoubaoCookie,
+    resolveLocalVideoPath,
   } = await import("@/api/controllers/doubao-videos.ts");
+
+  assert.equal(resolveLocalVideoPath("../evil.mp4"), null);
+  assert.ok(resolveLocalVideoPath("doubao_test123.mp4")?.endsWith("doubao_test123.mp4"));
 
   // 1. Model & Cookie / Auth parsing checks
   assert.equal(isDoubaoVideoModel("doubao-seedance-2.0-mini"), true);
@@ -253,6 +257,16 @@ async function main() {
     return origPost(url, data, config);
   };
 
+  const origGet = axios.get.bind(axios);
+  const fakeMp4Bytes = Buffer.from("00000018667479706d703432", "hex");
+  (axios as any).get = async (url: string, config?: any) => {
+    if (url === "https://cdn.doubao.com/clean.mp4?lr=unwatermarked") {
+      assert.equal(config?.headers?.Referer, "https://www.doubao.com/");
+      return { status: 200, data: fakeMp4Bytes };
+    }
+    return origGet(url, config);
+  };
+
   // Remove jimeng account temporarily to prove Doubao-only pool works on /v1/models and /v1/videos/generations
   accountPool.delete(jmAcc.id);
 
@@ -322,7 +336,12 @@ async function main() {
   });
   assert.equal(videoRes.status, 200);
   const videoBody: any = await videoRes.json();
-  assert.equal(videoBody.data?.[0]?.url, "https://cdn.doubao.com/clean.mp4?lr=unwatermarked");
+  const localVideoUrl = String(videoBody.data?.[0]?.url || "");
+  assert.ok(localVideoUrl.startsWith(`${baseUrl}/v1/videos/files/doubao_`) && localVideoUrl.endsWith(".mp4"));
+  const fileRes = await fetch(localVideoUrl);
+  assert.equal(fileRes.status, 200);
+  assert.ok((fileRes.headers.get("content-type") || "").includes("video/mp4"));
+  assert.deepEqual(Buffer.from(await fileRes.arrayBuffer()), fakeMp4Bytes);
   assert.equal(confirmCalled, true);
   assert.equal(accountPool.get(acc1.id).failureCount, 1);
   assert.ok(accountPool.get(acc1.id).cooldownUntil);
@@ -341,21 +360,21 @@ async function main() {
   });
   assert.equal(studioRes.status, 200);
   const studioBody: any = await studioRes.json();
-  assert.equal(studioBody.video_url, "https://cdn.doubao.com/clean.mp4?lr=unwatermarked");
+  assert.equal(studioBody.video_url, localVideoUrl);
   assert.equal(studioBody.account_name, "豆包2号");
   assert.equal(studioBody.duration, 10);
   assert.equal(studioBody.ratio, "21:9");
 
-  // Direct generateDoubaoVideo img2video check (base64 reference frame -> upload -> samantha -> poll -> clean URL)
+  // Direct generateDoubaoVideo img2video check (base64 reference frame -> upload -> samantha -> poll -> clean URL -> local cache)
   const tinyPngDataUri =
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
   const img2vidUrl = await generateDoubaoVideo(
     "doubao-seedance-2.0-mini",
     "图生视频运镜测试",
-    { duration: 5, ratio: "9:16", filePaths: [tinyPngDataUri], pollIntervalMs: 10 },
+    { duration: 5, ratio: "9:16", filePaths: [tinyPngDataUri], pollIntervalMs: 10, baseOrigin: baseUrl },
     "sessionid=db_healthy_002; ttwid=t2; passport_csrf_token=csrf2"
   );
-  assert.equal(img2vidUrl, "https://cdn.doubao.com/clean.mp4?lr=unwatermarked");
+  assert.equal(img2vidUrl, localVideoUrl);
   assert.equal(samanthaImg2VideoCalled, true);
 
   console.log("ALL DOUBAO SEEDANCE MULTI-ACCOUNT TESTS PASSED");

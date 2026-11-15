@@ -170,10 +170,11 @@ export default {
       const startedAt = Date.now();
       let videoUrl: string;
       let accountName = '';
+      const baseOrigin = request.headers?.host ? `http://${request.headers.host}` : undefined;
       try {
         const outcome = await executeWithPoolFailover(provider, (cred) =>
           useDoubao
-            ? generateDoubaoVideo(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths }, cred.token)
+            ? generateDoubaoVideo(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths, baseOrigin }, cred.token)
             : generateVideoWithRetry(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths }, cred.token)
         );
         videoUrl = outcome.result;

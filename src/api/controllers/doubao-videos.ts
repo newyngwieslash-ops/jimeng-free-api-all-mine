@@ -7,6 +7,7 @@ import mime from "mime";
 
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
+import config from "@/lib/config.ts";
 import logger from "@/lib/logger.ts";
 
 const BASE_URL = "https://www.doubao.com";
@@ -431,7 +432,7 @@ export function parseSamanthaSse(rawSse: string): {
         const content = typeof msg.content === "string" ? JSON.parse(msg.content) : msg.content;
         const items = Array.isArray(content?.data) ? content.data : [content];
         for (const item of items) {
-          const decoded = decodeVideoModelUrl(item?.video_model) || item?.video_url || item?.url || "";
+          const decoded = decodeVideoModelInfo(item?.video_model).url || item?.video_url || item?.url || "";
           if (decoded) {
             syncVideoUrl = decoded;
             break;
@@ -445,21 +446,23 @@ export function parseSamanthaSse(rawSse: string): {
   return { convId, agentText: agentText.trim(), syncVideoUrl, asyncTaskId, errorMessage };
 }
 
-function decodeVideoModelUrl(videoModelRaw: unknown): string {
-  if (!videoModelRaw) return "";
+function decodeVideoModelInfo(videoModelRaw: unknown): { url: string; vid: string } {
+  if (!videoModelRaw) return { url: "", vid: "" };
   try {
     const vm = typeof videoModelRaw === "string" ? JSON.parse(videoModelRaw) : videoModelRaw;
+    const vid = String((vm as any)?.video_id || "");
     const list = (vm as any)?.video_list || {};
     for (const key of ["video_1", "video_2", ...Object.keys(list)]) {
       const mainB64 = list[key]?.main_url;
       if (typeof mainB64 === "string" && mainB64) {
-        return Buffer.from(mainB64, "base64").toString("utf8");
+        return { url: Buffer.from(mainB64, "base64").toString("utf8"), vid };
       }
     }
+    return { url: "", vid };
   } catch {
     /* ignore */
   }
-  return "";
+  return { url: "", vid: "" };
 }
 
 export function extractVideoFromMessages(messages: any[]): {
@@ -488,8 +491,9 @@ export function extractVideoFromMessages(messages: any[]): {
         const v = cr?.video;
         if (!v) continue;
         // Prefer video_model.video_list.video_1.main_url (full 720p MP4); v.download_url can be truncated.
-        const url = decodeVideoModelUrl(v.video_model) || v.download_url || "";
-        const vid = String(v.vid || v.video_id || v.id || "");
+        const vmInfo = decodeVideoModelInfo(v.video_model);
+        const url = vmInfo.url || v.download_url || "";
+        const vid = String(v.vid || v.video_id || v.id || vmInfo.vid || cr?.id || "");
         if (url) return { url, vid };
       }
     }
@@ -807,7 +811,73 @@ async function pollConversationVideo(
   );
 }
 
-export async function generateDoubaoVideo(
+export function getDoubaoVideosDir(): string {
+  const dbFile = path.resolve(process.env.DB_PATH || "./data/jimeng.db");
+  return path.join(path.dirname(dbFile), "videos");
+}
+
+export function resolveLocalVideoPath(filename: string): string | null {
+  if (!filename || !/^[A-Za-z0-9._-]+\.mp4$/.test(filename) || filename.includes("..")) {
+    return null;
+  }
+  const dir = getDoubaoVideosDir();
+  const full = path.resolve(dir, filename);
+  return path.dirname(full) === dir ? full : null;
+}
+
+export async function cacheDoubaoVideoLocally(remoteUrl: string, baseOrigin?: string): Promise<string> {
+  if (!remoteUrl || !/^https?:\/\//i.test(remoteUrl)) return remoteUrl;
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(remoteUrl);
+  } catch {
+    return remoteUrl;
+  }
+  const host = parsedUrl.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "example.com" ||
+    host.endsWith(".example.com")
+  ) {
+    return remoteUrl;
+  }
+
+  try {
+    const dir = getDoubaoVideosDir();
+    await fs.ensureDir(dir);
+    const hash = crypto.createHash("sha1").update(`${parsedUrl.origin}${parsedUrl.pathname}`).digest("hex").slice(0, 16);
+    const filename = `doubao_${hash}.mp4`;
+    const filePath = path.join(dir, filename);
+
+    if (!(await fs.pathExists(filePath))) {
+      const res = await axios.get<ArrayBuffer>(remoteUrl, {
+        responseType: "arraybuffer",
+        headers: {
+          "User-Agent": USER_AGENT,
+          Origin: BASE_URL,
+          Referer: `${BASE_URL}/`,
+        },
+        timeout: 120_000,
+        maxContentLength: 300 * 1024 * 1024,
+      });
+      const tmpPath = `${filePath}.${process.pid}.tmp`;
+      await fs.writeFile(tmpPath, Buffer.from(res.data));
+      await fs.move(tmpPath, filePath, { overwrite: true });
+    }
+
+    const defaultOrigin = config.service.bindAddress
+      ? `http://${config.service.bindAddress.replace(/^https?:\/\//i, "")}`
+      : `http://localhost:${config.service.port}`;
+    const origin = (baseOrigin || defaultOrigin).replace(/\/+$/, "");
+    return `${origin}/v1/videos/files/${filename}`;
+  } catch (err: any) {
+    logger.warn(`豆包视频本地落盘缓存失败，回退远程直链: ${err?.message || err}`);
+    return remoteUrl;
+  }
+}
+
+async function generateRemoteDoubaoVideo(
   _model: string,
   prompt: string,
   options: {
@@ -986,6 +1056,24 @@ export async function generateDoubaoVideo(
     );
   }
   return await pollConversationVideo(convId, cookieHeader, msToken, pollIntervalMs, pollTimeoutMs);
+}
+
+export async function generateDoubaoVideo(
+  model: string,
+  prompt: string,
+  options: {
+    ratio?: string;
+    resolution?: string;
+    duration?: number;
+    filePaths?: string[];
+    pollIntervalMs?: number;
+    pollTimeoutMs?: number;
+    baseOrigin?: string;
+  } = {},
+  rawCredential: string
+): Promise<string> {
+  const remoteUrl = await generateRemoteDoubaoVideo(model, prompt, options, rawCredential);
+  return await cacheDoubaoVideoLocally(remoteUrl, options.baseOrigin);
 }
 
 export async function getDoubaoAccountStatus(rawCredential: string): Promise<{
