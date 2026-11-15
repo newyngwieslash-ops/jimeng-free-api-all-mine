@@ -16,6 +16,7 @@ import {
 } from '@/api/controllers/doubao-videos.ts';
 import { executeWithPoolFailover } from '@/api/controllers/auth.ts';
 import logger from '@/lib/logger.ts';
+import { cancelQrLogin, getQrLogin, inputQrLogin, screenshotQrLogin, startQrLogin } from '@/lib/qr-login.ts';
 
 const STUDIO_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 
@@ -62,6 +63,18 @@ export default {
     '/settings': async (request: Request) => {
       const error = authError(request); if (error) return error;
       return { browserTransport: await browserTransport.getStatus() };
+    },
+    '/qr-login/:id': async (request: Request) => {
+      const error = authError(request); if (error) return error;
+      try { return getQrLogin(String(request.params.id)); }
+      catch (e: any) { return new Response({ error: e.message }, { statusCode: 404 }); }
+    },
+    '/qr-login/:id/screen': async (request: Request) => {
+      const error = authError(request); if (error) return error;
+      try {
+        const image = await screenshotQrLogin(String(request.params.id));
+        return new Response(image, { type: 'image/jpeg', headers: { 'Cache-Control': 'no-store' } });
+      } catch (e: any) { return new Response({ error: e.message }, { statusCode: 410 }); }
     }
   },
   post: {
@@ -114,6 +127,28 @@ export default {
         return new Response({ error: '模式参数无效' }, { statusCode: 400 });
       await browserTransport.setMode(mode);
       return { success: true, browserTransport: await browserTransport.getStatus() };
+    },
+    '/qr-login': async (request: Request) => {
+      const error = authError(request); if (error) return error;
+      const provider = request.body?.provider;
+      if (provider !== 'jimeng' && provider !== 'doubao') return new Response({ error: '平台参数无效' }, { statusCode: 400 });
+      try {
+        return await startQrLogin({
+          provider,
+          name: typeof request.body?.name === 'string' ? request.body.name : undefined,
+          accountId: typeof request.body?.accountId === 'string' ? request.body.accountId : undefined,
+        });
+      } catch (e: any) {
+        logger.error(`启动扫码登录失败: ${e.message}`);
+        return new Response({ error: e.message }, { statusCode: 500 });
+      }
+    },
+    '/qr-login/:id/input': async (request: Request) => {
+      const error = authError(request); if (error) return error;
+      try {
+        await inputQrLogin(String(request.params.id), request.body || {});
+        return { success: true };
+      } catch (e: any) { return new Response({ error: e.message }, { statusCode: 400 }); }
     },
     '/video-generate': async (request: Request) => {
       const error = authError(request); if (error) return error;
@@ -175,7 +210,7 @@ export default {
         const outcome = await executeWithPoolFailover(provider, (cred) =>
           useDoubao
             ? generateDoubaoVideo(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths, baseOrigin }, cred.token)
-            : generateVideoWithRetry(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths }, cred.token)
+            : generateVideoWithRetry(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths, baseOrigin }, cred.token)
         );
         videoUrl = outcome.result;
         accountName = outcome.credential.accountName || '';
@@ -183,10 +218,11 @@ export default {
         const msg = String(e?.message || '视频生成失败');
         if (msg.includes('没有可用的')) {
           return new Response(
-            { error: `账号池无可用${useDoubao ? '豆包' : '即梦'}账号，请先在「账号池」添加并启用${useDoubao ? '豆包' : '即梦'}账号` },
+            { error: `账号池无可用${useDoubao ? '豆包' : '即梦'}账号，请先在「账号池」添加并启用${useDoubao ? '豆包' : '即梦'}账号（或账号积分今日已用完、处于冷却中）` },
             { statusCode: 503 }
           );
         }
+        if (e?.name === 'AccountBusyError') return new Response({ error: msg }, { statusCode: 503 });
         logger.error(`视频创作页生成失败 (${selectedModel}): ${msg}`);
         return new Response({ error: msg }, { statusCode: 502 });
       }
@@ -213,6 +249,11 @@ export default {
     }
   },
   delete: {
+    '/qr-login/:id': async (request: Request) => {
+      const error = authError(request); if (error) return error;
+      await cancelQrLogin(String(request.params.id));
+      return { success: true };
+    },
     '/logs': async (request: Request) => {
       const error = authError(request); if (error) return error;
       db.clearLogs();

@@ -9,6 +9,8 @@ const testPort = 18900 + Math.floor(Math.random() * 500);
 process.env.DB_PATH = path.join(tmpDir, "test.db");
 process.env.JIMENG_ACCOUNT_POOL_KEY = "unit-test-encryption-key-2026";
 process.env.SERVER_PORT = String(testPort);
+// 测试里不要用后真实刷新账号积分（会访问真实上游）
+process.env.ACCOUNT_REFRESH_AFTER_USE = "false";
 
 async function main() {
   const axiosMod = await import("axios");
@@ -18,6 +20,7 @@ async function main() {
   const accountPool = (await import("@/lib/account-pool.ts")).default;
   const {
     executeWithPoolFailover,
+    executeWithCredentialFailover,
     splitAuthCredentials,
   } = await import("@/api/controllers/auth.ts");
   const {
@@ -168,6 +171,75 @@ async function main() {
     /空提示词/
   );
   assert.equal(accountPool.get(acc1.id).failureCount, 0);
+
+  // Errors after upstream submission (noFailover) must NOT retry on another credential
+  let submittedCalls = 0;
+  await assert.rejects(
+    () =>
+      executeWithCredentialFailover("Bearer tokA,tokB", "jimeng", async () => {
+        submittedCalls++;
+        throw Object.assign(new APIException(EX.API_VIDEO_GENERATION_FAILED, "已提交后超时"), { noFailover: true });
+      }),
+    /已提交后超时/
+  );
+  assert.equal(submittedCalls, 1);
+
+  // Per-account concurrency: all accounts at the limit -> AccountBusyError (callers queue instead of failing)
+  const { AccountBusyError } = await import("@/lib/account-pool.ts");
+  for (const id of [acc1.id, acc1.id, acc2.id, acc2.id]) accountPool.acquire(id);
+  assert.throws(
+    () => accountPool.select("round_robin", { provider: "doubao", checkConcurrency: true }),
+    (err: any) => err instanceof AccountBusyError
+  );
+  for (const id of [acc1.id, acc1.id, acc2.id, acc2.id]) accountPool.release(id);
+
+  // Per-account device identity: stable for one account, different across accounts
+  const { deviceIdentity } = await import("@/api/controllers/core.ts");
+  assert.equal(deviceIdentity("sess_a").webId, deviceIdentity("sess_a").webId);
+  assert.notEqual(deviceIdentity("sess_a").webId, deviceIdentity("sess_b").webId);
+  assert.match(deviceIdentity("sess_a").webId, /^7\d{18}$/);
+
+  // QR login: waits for the site's own sessionid (ignores douyin.com from the OAuth popup), then saves only site cookies
+  const browserTransport = (await import("@/lib/browser-transport.ts")).default;
+  let fakeCookies: Array<{ name: string; value: string; domain: string }> = [{ name: "ttwid", value: "t9", domain: ".doubao.com" }];
+  let fakeContextClosed = false;
+  const fakePage: any = {
+    goto: async () => undefined,
+    waitForTimeout: async () => undefined,
+    getByText: () => ({ first: () => ({ click: async () => undefined }), last: () => ({ click: async () => undefined }) }),
+    screenshot: async () => Buffer.from("jpeg"),
+    mouse: { click: async () => undefined },
+    keyboard: { press: async () => undefined },
+    on: () => undefined,
+  };
+  const fakeContext: any = {
+    newPage: async () => fakePage,
+    on: () => undefined,
+    pages: () => [fakePage],
+    cookies: async () => fakeCookies,
+    close: async () => { fakeContextClosed = true; },
+  };
+  const origNewContext = browserTransport.newIsolatedContext;
+  (browserTransport as any).newIsolatedContext = async () => fakeContext;
+  const { startQrLogin, getQrLogin, screenshotQrLogin, inputQrLogin } = await import("@/lib/qr-login.ts");
+  const qr = await startQrLogin({ provider: "doubao", name: "扫码豆包" });
+  assert.equal(qr.status, "waiting");
+  assert.equal((await screenshotQrLogin(qr.id)).toString(), "jpeg");
+  await inputQrLogin(qr.id, { type: "click", x: 100, y: 200 });
+  await assert.rejects(() => inputQrLogin(qr.id, { type: "key", key: "Control+W" }), /按键无效/);
+  fakeCookies = [...fakeCookies, { name: "sessionid", value: "douyin_sess", domain: ".douyin.com" }];
+  await new Promise((r) => setTimeout(r, 1800));
+  assert.equal(getQrLogin(qr.id).status, "waiting");
+  fakeCookies = [...fakeCookies, { name: "sessionid", value: "db_qr_003", domain: ".doubao.com" }];
+  for (let i = 0; i < 30 && getQrLogin(qr.id).status === "waiting"; i++) await new Promise((r) => setTimeout(r, 200));
+  for (let i = 0; i < 30 && !getQrLogin(qr.id).account; i++) await new Promise((r) => setTimeout(r, 200));
+  const qrDone = getQrLogin(qr.id);
+  assert.equal(qrDone.status, "success", qrDone.error || "");
+  assert.equal(qrDone.account?.name, "扫码豆包");
+  assert.equal(accountPool.getCredential(qrDone.account!.id).credential, "ttwid=t9; sessionid=db_qr_003");
+  assert.equal(fakeContextClosed, true);
+  accountPool.delete(qrDone.account!.id);
+  (browserTransport as any).newIsolatedContext = origNewContext;
 
   // Mock Doubao upstream HTTP for end-to-end multi-account failover + 2-step confirm + Samantha img2video + clean URL
   const origPost = axios.post.bind(axios);
@@ -392,6 +464,100 @@ async function main() {
   assert.equal(accountPool.get(acc1.id).failureCount, 1);
   assert.ok(accountPool.get(acc1.id).cooldownUntil);
   assert.equal(accountPool.get(acc2.id).successCount, 1);
+
+  // Doubao task persists the conversation id once submitted, and resumes it after a restart without resubmitting
+  const { getVideoTask, createVideoTask, updateVideoTask } = await import("@/lib/database.ts");
+  const { resumeVideoTasks } = await import("@/api/controllers/video-tasks.ts");
+  assert.equal(getVideoTask(videoBody.task_id)?.history_id, "7488888888888888888");
+  const doubaoOrphan = createVideoTask({ owner_hash: "o", idempotency_key: null, provider: "doubao", model: "doubao-seedance-2.0-mini", prompt: "p" });
+  updateVideoTask(doubaoOrphan.id, { account_id: acc2.id, account_name: "豆包2号", history_id: "7488888888888888888" });
+  confirmCalled = false;
+  resumeVideoTasks();
+  for (let i = 0; i < 30 && getVideoTask(doubaoOrphan.id)?.status === "running"; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.equal(getVideoTask(doubaoOrphan.id)?.status, "succeeded", getVideoTask(doubaoOrphan.id)?.error || "");
+  assert.ok(String(getVideoTask(doubaoOrphan.id)?.video_url).includes("/v1/videos/files/doubao_"));
+  assert.equal(confirmCalled, false); // polled only, nothing resubmitted
+
+  // 5. Jimeng async task: submit -> idempotent resubmit -> poll -> local file; historyId persisted
+  const jmAcc2 = accountPool.create({ name: "即梦2号", provider: "jimeng", sessionId: "jm_session_abc" });
+  const jimengVideoUrl = "https://vlabvod.jimengcdn.test/obj/jimeng-out.mp4?sign=1";
+  let jimengGenerateCalls = 0;
+  const origRequest = axios.request.bind(axios);
+  (axios as any).request = async (config: any) => {
+    const url = String(config?.url || "");
+    if (!url.startsWith("https://jimeng.jianying.com")) return origRequest(config);
+    const ok = (data: any) => ({ status: 200, statusText: "OK", data: { ret: "0", errmsg: "", data } });
+    if (url.includes("/commerce/v1/benefits/user_credit"))
+      return ok({ credit: { gift_credit: 100, purchase_credit: 0, vip_credit: 0 } });
+    if (url.includes("/mweb/v1/aigc_draft/generate")) {
+      jimengGenerateCalls++;
+      assert.equal(config.params.webId, deviceIdentity("jm_session_abc").webId);
+      assert.ok(String(config.headers.Cookie).includes("sessionid=jm_session_abc"));
+      return ok({ aigc_data: { history_record_id: "hist_42" } });
+    }
+    if (url.includes("/mweb/v1/get_history_by_ids"))
+      return ok({ history_list: [{ status: 50, item_list: [{ video: { play_url: jimengVideoUrl } }] }] });
+    return ok({});
+  };
+  const getBeforeJimeng = (axios as any).get;
+  (axios as any).get = async (url: string, config?: any) => {
+    if (url === jimengVideoUrl) {
+      assert.equal(config?.headers?.Referer, "https://jimeng.jianying.com/");
+      return { status: 200, data: fakeMp4Bytes };
+    }
+    return getBeforeJimeng(url, config);
+  };
+
+  const submitAsync = () => fetch(`${baseUrl}/v1/videos/generations`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${keyData.key}`, "Content-Type": "application/json", "Idempotency-Key": "idem-jm-1" },
+    body: JSON.stringify({ model: "jimeng-video-seedance-2.0-fast", prompt: "镜头推进", duration: 5, async: true }),
+  });
+  const asyncRes = await submitAsync();
+  assert.equal(asyncRes.status, 200);
+  const asyncTask: any = await asyncRes.json();
+  assert.ok(String(asyncTask.id).startsWith("vt_"));
+  assert.equal(asyncTask.status, "running");
+  const dupTask: any = await (await submitAsync()).json();
+  assert.equal(dupTask.id, asyncTask.id);
+
+  // Another caller cannot see this task
+  const foreignRes = await fetch(`${baseUrl}/v1/videos/generations/${asyncTask.id}`, {
+    headers: { Authorization: "Bearer someone-else-token" },
+  });
+  assert.equal(foreignRes.status, 404);
+
+  let finalTask: any;
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    finalTask = await (await fetch(`${baseUrl}/v1/videos/generations/${asyncTask.id}`, {
+      headers: { Authorization: `Bearer ${keyData.key}` },
+    })).json();
+    if (finalTask.status !== "running") break;
+  }
+  assert.equal(finalTask.status, "succeeded", JSON.stringify(finalTask));
+  assert.ok(String(finalTask.url).startsWith(`${baseUrl}/v1/videos/files/jimeng_`));
+  assert.equal((await fetch(finalTask.url)).status, 200);
+  assert.equal(jimengGenerateCalls, 1);
+  assert.equal(getVideoTask(asyncTask.id)?.history_id, "hist_42");
+  assert.equal(getVideoTask(asyncTask.id)?.account_id, jmAcc2.id);
+
+  // Restart recovery: submitted jimeng task resumes polling (no resubmit); unsubmitted task is marked failed
+  const orphanSubmitted = createVideoTask({ owner_hash: "o", idempotency_key: null, provider: "jimeng", model: "m", prompt: "p" });
+  updateVideoTask(orphanSubmitted.id, { account_id: jmAcc2.id, account_name: "即梦2号", history_id: "hist_42" });
+  const orphanUnsubmitted = createVideoTask({ owner_hash: "o", idempotency_key: null, provider: "jimeng", model: "m", prompt: "p" });
+  resumeVideoTasks();
+  assert.equal(getVideoTask(orphanUnsubmitted.id)?.status, "failed");
+  for (let i = 0; i < 30 && getVideoTask(orphanSubmitted.id)?.status === "running"; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  assert.equal(getVideoTask(orphanSubmitted.id)?.status, "succeeded");
+  assert.equal(jimengGenerateCalls, 1);
+  (axios as any).request = origRequest;
+  (axios as any).get = getBeforeJimeng;
+  accountPool.delete(jmAcc2.id);
 
   // /dashboard/video-generate works without first_frame (text-to-video on Doubao)
   const form = new FormData();

@@ -82,6 +82,26 @@ db.exec(`
     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
   );
 
+  -- 视频生成任务（异步查询、幂等去重、重启后续查）
+  CREATE TABLE IF NOT EXISTS video_tasks (
+    id TEXT PRIMARY KEY,
+    owner_hash TEXT NOT NULL,
+    idempotency_key TEXT,
+    status TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    account_id TEXT,
+    account_name TEXT,
+    history_id TEXT,
+    video_url TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_video_tasks_idem ON video_tasks(owner_hash, idempotency_key);
+  CREATE INDEX IF NOT EXISTS idx_video_tasks_status ON video_tasks(status);
+
   -- 创建索引
   CREATE INDEX IF NOT EXISTS idx_key_stats_key ON key_stats(key_hash);
   CREATE INDEX IF NOT EXISTS idx_api_keys_enabled ON api_keys(enabled);
@@ -371,6 +391,65 @@ export function setSetting(key: string, value: string): void {
   ).run(key, value);
 }
 
+// ==================== 视频任务 ====================
+
+export type VideoTaskStatus = 'running' | 'succeeded' | 'failed';
+
+export interface VideoTask {
+  id: string;
+  owner_hash: string;
+  idempotency_key: string | null;
+  status: VideoTaskStatus;
+  provider: string;
+  model: string;
+  prompt: string;
+  account_id: string | null;
+  account_name: string | null;
+  history_id: string | null;
+  video_url: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 任务归属：按调用方凭据哈希隔离，只能查询自己的任务 */
+export function taskOwnerHash(authorization: string): string {
+  return crypto.createHash('sha256').update((authorization || '').replace(/^Bearer\s+/i, '').trim()).digest('hex');
+}
+
+export function createVideoTask(input: Pick<VideoTask, 'owner_hash' | 'idempotency_key' | 'provider' | 'model' | 'prompt'>): VideoTask {
+  const id = `vt_${crypto.randomBytes(12).toString('hex')}`;
+  const timestamp = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO video_tasks (id, owner_hash, idempotency_key, status, provider, model, prompt, created_at, updated_at)
+     VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)`
+  ).run(id, input.owner_hash, input.idempotency_key, input.provider, input.model, input.prompt, timestamp, timestamp);
+  return getVideoTask(id)!;
+}
+
+export function getVideoTask(id: string): VideoTask | undefined {
+  return db.prepare('SELECT * FROM video_tasks WHERE id = ?').get(id) as VideoTask | undefined;
+}
+
+export function findVideoTaskByIdempotency(ownerHash: string, idempotencyKey: string): VideoTask | undefined {
+  return db.prepare('SELECT * FROM video_tasks WHERE owner_hash = ? AND idempotency_key = ?')
+    .get(ownerHash, idempotencyKey) as VideoTask | undefined;
+}
+
+export function updateVideoTask(
+  id: string,
+  fields: Partial<Pick<VideoTask, 'status' | 'account_id' | 'account_name' | 'history_id' | 'video_url' | 'error'>>
+): void {
+  const keys = Object.keys(fields);
+  if (!keys.length) return;
+  db.prepare(`UPDATE video_tasks SET ${keys.map(key => `${key} = ?`).join(', ')}, updated_at = ? WHERE id = ?`)
+    .run(...keys.map(key => (fields as any)[key] ?? null), new Date().toISOString(), id);
+}
+
+export function listRunningVideoTasks(): VideoTask[] {
+  return db.prepare("SELECT * FROM video_tasks WHERE status = 'running' ORDER BY created_at ASC").all() as VideoTask[];
+}
+
 export default {
   isSetupComplete,
   createUser,
@@ -392,5 +471,6 @@ export default {
   getLogs,
   clearLogs,
   getSetting,
-  setSetting
+  setSetting,
+  taskOwnerHash
 };

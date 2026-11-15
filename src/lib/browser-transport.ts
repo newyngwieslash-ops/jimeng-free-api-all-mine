@@ -1,4 +1,4 @@
-import _ from "lodash";
+import crypto from "crypto";
 
 import logger from "./logger.ts";
 import { getSetting, setSetting } from "./database.ts";
@@ -145,22 +145,21 @@ class BrowserTransport {
   /** 额外的浏览器启动参数 */
   private readonly launchArgs: string[];
 
-  /** 浏览器实例 */
+  /** 浏览器实例（所有账号共享进程） */
   private browser: any = null;
-  /** 浏览器上下文 */
-  private context: any = null;
-  /** 页面实例 */
-  private page: any = null;
   /** 正在启动中的 Promise，避免并发重复启动 */
   private launching: Promise<void> | null = null;
-  /** 当前页面已应用的 cookie 指纹 */
-  private cookieFingerprint = "";
-  /** 空闲关闭定时器 */
-  private idleTimer: NodeJS.Timeout | null = null;
+  /**
+   * 每个账号一个独立上下文：设备 cookie / 签名 SDK 状态互相隔离，避免多账号被关联；
+   * 同一账号内串行，不同账号之间并行
+   */
+  private readonly sessions = new Map<string, BrowserSession>();
+  /** 同时保留的账号上下文上限（每个上下文都会装载一个即梦页面，较占内存） */
+  private readonly maxContexts: number;
+  /** 扫码登录等独立上下文数量（存在时不因空闲关闭浏览器） */
+  private isolatedContexts = 0;
   /** 已知需要浏览器签名的请求标识 */
   private readonly browserRequiredKeys = new Set<string>();
-  /** 请求串行队列 */
-  private queue: Promise<any> = Promise.resolve();
 
   constructor() {
     const env = process.env;
@@ -171,6 +170,7 @@ class BrowserTransport {
     this.requestTimeout = Number(env.JIMENG_BROWSER_REQUEST_TIMEOUT || 60000);
     this.navigationTimeout = Number(env.JIMENG_BROWSER_NAVIGATION_TIMEOUT || 90000);
     this.idleTimeout = Number(env.JIMENG_BROWSER_IDLE_TIMEOUT || 300000);
+    this.maxContexts = Math.max(1, Number(env.JIMENG_BROWSER_MAX_CONTEXTS) || 4);
     this.userAgent =
       env.JIMENG_BROWSER_USER_AGENT ||
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
@@ -274,7 +274,9 @@ class BrowserTransport {
       defaultMode: DEFAULT_BROWSER_TRANSPORT_MODE,
       envMode: this.normalizeMode(process.env.JIMENG_BROWSER_TRANSPORT),
       dependencyAvailable: await this.isDependencyAvailable(),
-      browserRunning: Boolean(this.page && !this.page.isClosed()),
+      browserRunning: Boolean(this.browser),
+      contexts: this.sessions.size,
+      maxContexts: this.maxContexts,
       markedKeys: Array.from(this.browserRequiredKeys),
     };
   }
@@ -306,26 +308,53 @@ class BrowserTransport {
    * @param options 请求参数
    */
   async request(options: BrowserRequestOptions): Promise<BrowserResponse> {
-    // 串行执行：多账号场景下切换 cookie 需要独占页面
-    const task = this.queue.then(
-      () => this.execute(options),
-      () => this.execute(options)
+    const key = sessionKey(options.cookiePairs);
+    let session = this.sessions.get(key);
+    if (!session) {
+      session = { key, context: null, page: null, ready: null, queue: Promise.resolve(), pending: 0, lastUsed: Date.now(), idleTimer: null };
+      this.sessions.set(key, session);
+    }
+    const target = session;
+    target.pending++;
+    // 同一账号串行（共用一个页面），不同账号各自独立并行
+    const task = target.queue.then(
+      () => this.execute(target, options),
+      () => this.execute(target, options)
     );
-    this.queue = task.catch(() => undefined);
+    target.queue = task.catch(() => undefined).finally(() => {
+      target.pending--;
+      this.touch(target);
+    });
     return task;
   }
 
-  /** 关闭浏览器 */
+  /**
+   * 创建不参与请求调度的独立上下文（扫码登录用），复用同一浏览器与启动配置；用完调用 context.close()
+   */
+  async newIsolatedContext() {
+    const browser = await this.ensureBrowser();
+    const context = await browser.newContext({
+      userAgent: this.userAgent,
+      viewport: VIEWPORT,
+      locale: "zh-CN",
+      timezoneId: "Asia/Shanghai",
+    });
+    this.isolatedContexts++;
+    context.on("close", () => {
+      this.isolatedContexts--;
+      if (!this.isolatedContexts && !this.sessions.size) this.close();
+    });
+    return context;
+  }
+
+  /** 关闭浏览器及所有账号上下文 */
   async close() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
+    for (const session of this.sessions.values()) {
+      if (session.idleTimer) clearTimeout(session.idleTimer);
     }
+    this.sessions.clear();
     const browser = this.browser;
     this.browser = null;
-    this.context = null;
-    this.page = null;
-    this.cookieFingerprint = "";
     if (!browser) return;
     try {
       await browser.close();
@@ -338,37 +367,31 @@ class BrowserTransport {
   /**
    * 执行请求
    */
-  private async execute(options: BrowserRequestOptions): Promise<BrowserResponse> {
-    const page = await this.ensurePage();
-    await this.applyCookies(options.cookiePairs);
-
-    logger.info(`[浏览器传输] ${options.method.toUpperCase()} ${options.url}`);
-    let result = await page.evaluate(inPageRequest, {
+  private async execute(session: BrowserSession, options: BrowserRequestOptions): Promise<BrowserResponse> {
+    session.lastUsed = Date.now();
+    const payload = {
       url: options.url,
       method: options.method.toUpperCase(),
       params: options.params || {},
       headers: options.headers || {},
       data: options.data ?? null,
       timeout: this.requestTimeout,
-    });
+    };
 
-    // 浏览器或页面异常时重启一次
+    logger.info(`[浏览器传输] ${payload.method} ${options.url}`);
+    let page = await this.ensureSessionPage(session, options.cookiePairs);
+    let result = await page.evaluate(inPageRequest, payload).catch((error: any) => ({
+      status: 0, statusText: "", text: "", error: String(error?.message || error),
+    }));
+
+    // 页面或上下文异常时重建该账号的上下文重试一次
     if (result.status === 0 && result.error) {
-      logger.warn(`[浏览器传输] 请求失败，重建浏览器后重试: ${result.error}`);
-      await this.close();
-      const retryPage = await this.ensurePage();
-      await this.applyCookies(options.cookiePairs);
-      result = await retryPage.evaluate(inPageRequest, {
-        url: options.url,
-        method: options.method.toUpperCase(),
-        params: options.params || {},
-        headers: options.headers || {},
-        data: options.data ?? null,
-        timeout: this.requestTimeout,
-      });
+      logger.warn(`[浏览器传输] 请求失败，重建账号上下文后重试: ${result.error}`);
+      await this.closeSession(session);
+      page = await this.ensureSessionPage(session, options.cookiePairs);
+      result = await page.evaluate(inPageRequest, payload);
     }
 
-    this.touch();
     if (result.status === 0)
       throw new Error(`[浏览器传输] 请求失败: ${result.error || "未知错误"}`);
 
@@ -388,22 +411,74 @@ class BrowserTransport {
   }
 
   /**
-   * 确保页面可用
+   * 确保浏览器已启动
    */
-  private async ensurePage() {
-    if (this.page && !this.page.isClosed()) return this.page;
+  private async ensureBrowser() {
+    if (this.browser) return this.browser;
     if (!this.launching) {
-      this.launching = this.launch().finally(() => (this.launching = null));
+      this.launching = this.launchBrowser().finally(() => (this.launching = null));
     }
     await this.launching;
-    if (!this.page) throw new Error("[浏览器传输] 浏览器页面不可用");
-    return this.page;
+    if (!this.browser) throw new Error("[浏览器传输] 浏览器不可用");
+    return this.browser;
   }
 
   /**
-   * 启动浏览器并装载即梦页面
+   * 确保账号上下文与页面可用（首次使用时创建并装载即梦页面）
    */
-  private async launch() {
+  private async ensureSessionPage(session: BrowserSession, cookiePairs: Array<[string, string]>) {
+    if (session.page && !session.page.isClosed()) return session.page;
+    if (!session.ready) {
+      session.ready = this.openSession(session, cookiePairs).catch((error) => {
+        session.ready = null;
+        throw error;
+      });
+    }
+    await session.ready;
+    if (!session.page) throw new Error("[浏览器传输] 浏览器页面不可用");
+    return session.page;
+  }
+
+  /**
+   * 为账号创建独立上下文：先写入账号 cookie 再打开页面，签名 SDK 以该账号身份初始化
+   */
+  private async openSession(session: BrowserSession, cookiePairs: Array<[string, string]>) {
+    await this.evictIdleSessions(session);
+    const browser = await this.ensureBrowser();
+    session.context = await browser.newContext({
+      userAgent: this.userAgent,
+      viewport: VIEWPORT,
+      locale: "zh-CN",
+      timezoneId: "Asia/Shanghai",
+    });
+    if (cookiePairs?.length) {
+      await session.context.addCookies(
+        cookiePairs.map(([name, value]) => ({ name, value, domain: ".jianying.com", path: "/" }))
+      );
+    }
+    session.page = await session.context.newPage();
+    session.page.on("close", () => {
+      session.page = null;
+    });
+
+    await session.page.goto(this.pageUrl, { waitUntil: "domcontentloaded", timeout: this.navigationTimeout });
+    await session.page.waitForTimeout(APP_READY_DELAY);
+
+    const ready = await session.page
+      .evaluate(() => ({
+        href: location.href,
+        hasBdms: typeof (window as any).bdms !== "undefined",
+      }))
+      .catch(() => ({ href: "", hasBdms: false }));
+    if (!ready.hasBdms)
+      logger.warn("[浏览器传输] 页面未检测到签名 SDK，若请求仍被风控拦截请检查页面地址或登录状态");
+    logger.info(`浏览器传输层账号上下文就绪（${this.sessions.size}/${this.maxContexts}）: ${ready.href}`);
+  }
+
+  /**
+   * 启动浏览器
+   */
+  private async launchBrowser() {
     let playwright: any;
     try {
       playwright = await import("playwright-core");
@@ -432,62 +507,84 @@ class BrowserTransport {
       logger.warn(`默认通道启动失败（${error?.message || error}），尝试使用本机 Edge`);
       this.browser = await playwright.chromium.launch({ ...launchOptions, channel: "msedge" });
     }
-
-    this.context = await this.browser.newContext({
-      userAgent: this.userAgent,
-      viewport: VIEWPORT,
-      locale: "zh-CN",
-      timezoneId: "Asia/Shanghai",
+    this.browser.on?.("disconnected", () => {
+      this.browser = null;
+      // 浏览器崩溃：保留会话对象，下次请求时在新浏览器里重建上下文
+      for (const session of this.sessions.values()) {
+        session.context = null;
+        session.page = null;
+        session.ready = null;
+      }
     });
-    this.page = await this.context.newPage();
-    this.page.on("close", () => {
-      this.page = null;
-    });
-
-    await this.page.goto(this.pageUrl, { waitUntil: "domcontentloaded", timeout: this.navigationTimeout });
-    await this.page.waitForTimeout(APP_READY_DELAY);
-
-    const ready = await this.page
-      .evaluate(() => ({
-        href: location.href,
-        hasBdms: typeof (window as any).bdms !== "undefined",
-      }))
-      .catch(() => ({ href: "", hasBdms: false }));
-    if (!ready.hasBdms)
-      logger.warn("[浏览器传输] 页面未检测到签名 SDK，若请求仍被风控拦截请检查页面地址或登录状态");
-    logger.info(`浏览器传输层就绪: ${ready.href}`);
   }
 
   /**
-   * 同步账号 cookie 到浏览器上下文
-   *
-   * @param cookiePairs cookie 键值对
+   * 上下文数量达到上限时，关闭最久未用且空闲的账号上下文
    */
-  private async applyCookies(cookiePairs: Array<[string, string]>) {
-    if (!cookiePairs?.length) return;
-    const fingerprint = _.orderBy(cookiePairs, ([name]) => name)
-      .map(([name, value]) => `${name}=${_.size(value)}`)
-      .join("&");
-    if (fingerprint === this.cookieFingerprint) return;
-    await this.context.addCookies(
-      cookiePairs.map(([name, value]) => ({ name, value, domain: ".jianying.com", path: "/" }))
-    );
-    this.cookieFingerprint = fingerprint;
+  private async evictIdleSessions(except: BrowserSession) {
+    const open = () => [...this.sessions.values()].filter((s) => s !== except && s.context);
+    while (open().length >= this.maxContexts) {
+      const victim = open()
+        .filter((s) => s.pending === 0)
+        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+      // 全部在忙：允许临时超出上限，避免请求卡死
+      if (!victim) return;
+      await this.closeSession(victim);
+      this.sessions.delete(victim.key);
+    }
+  }
+
+  /** 关闭某个账号的上下文（保留会话对象，下次请求时重建） */
+  private async closeSession(session: BrowserSession) {
+    const context = session.context;
+    session.context = null;
+    session.page = null;
+    session.ready = null;
+    if (!context) return;
+    try {
+      await context.close();
+    } catch (error: any) {
+      logger.warn(`关闭账号上下文失败: ${error?.message || error}`);
+    }
   }
 
   /**
-   * 刷新空闲关闭定时器
+   * 刷新账号上下文的空闲关闭定时器；所有上下文都关闭后关闭浏览器
    */
-  private touch() {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+  private touch(session: BrowserSession) {
+    if (session.idleTimer) clearTimeout(session.idleTimer);
     if (!this.idleTimeout) return;
-    this.idleTimer = setTimeout(() => {
-      logger.info(`浏览器传输层空闲超过 ${Math.round(this.idleTimeout / 1000)} 秒，自动关闭`);
-      this.close();
+    session.idleTimer = setTimeout(async () => {
+      if (session.pending > 0) return this.touch(session);
+      await this.closeSession(session);
+      this.sessions.delete(session.key);
+      if (!this.sessions.size && !this.isolatedContexts && this.browser) {
+        logger.info(`浏览器传输层空闲超过 ${Math.round(this.idleTimeout / 1000)} 秒，自动关闭`);
+        await this.close();
+      }
     }, this.idleTimeout);
-    this.idleTimer.unref?.();
+    session.idleTimer.unref?.();
   }
 
+}
+
+/** 浏览器内某个账号的独立会话 */
+interface BrowserSession {
+  key: string;
+  context: any;
+  page: any;
+  ready: Promise<void> | null;
+  queue: Promise<any>;
+  /** 排队及执行中的请求数 */
+  pending: number;
+  lastUsed: number;
+  idleTimer: NodeJS.Timeout | null;
+}
+
+/** 按账号 sessionid 区分上下文（取哈希，避免凭据出现在日志或内存键中） */
+function sessionKey(cookiePairs: Array<[string, string]>): string {
+  const sessionId = cookiePairs?.find(([name]) => name === "sessionid")?.[1] || "";
+  return crypto.createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
 }
 
 export default new BrowserTransport();

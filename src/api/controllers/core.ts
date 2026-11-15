@@ -19,12 +19,19 @@ const DEFAULT_ASSISTANT_ID = 513695;
 const VERSION_CODE = "5.8.0";
 // 平台代码
 const PLATFORM_CODE = "7";
-// 设备ID
-const DEVICE_ID = Math.random() * 999999999999999999 + 7000000000000000000;
-// WebID
-const WEB_ID = Math.random() * 999999999999999999 + 7000000000000000000;
-// 用户ID
-const USER_ID = util.uuid(false);
+/**
+ * 按账号生成稳定的设备身份（webId / uid）
+ *
+ * 全进程共用一套随机 ID 会让上游看到「很多账号挤在同一台设备」，容易被关联风控；
+ * 由 token 哈希派生，同一账号跨重启保持不变。
+ */
+export function deviceIdentity(token: string) {
+  const hash = util.md5(`device:${token}`);
+  return {
+    webId: (BigInt("7000000000000000000") + BigInt(`0x${hash.slice(0, 15)}`)).toString(),
+    userId: hash,
+  };
+}
 // 最大重试次数
 const MAX_RETRY_COUNT = 3;
 // 重试延迟
@@ -70,14 +77,15 @@ export async function acquireToken(refreshToken: string): Promise<string> {
  * 生成cookie
  */
 export function generateCookie(refreshToken: string) {
+  const { webId, userId } = deviceIdentity(refreshToken);
   return [
-    `_tea_web_id=${WEB_ID}`,
+    `_tea_web_id=${webId}`,
     `is_staff_user=false`,
     `store-region=cn-gd`,
     `store-region-src=uid`,
     `sid_guard=${refreshToken}%7C${util.unixTimestamp()}%7C5184000%7CMon%2C+03-Feb-2025+08%3A17%3A09+GMT`,
-    `uid_tt=${USER_ID}`,
-    `uid_tt_ss=${USER_ID}`,
+    `uid_tt=${userId}`,
+    `uid_tt_ss=${userId}`,
     `sid_tt=${refreshToken}`,
     `sessionid=${refreshToken}`,
     `sessionid_ss=${refreshToken}`,
@@ -191,7 +199,7 @@ export async function request(
     aid: DEFAULT_ASSISTANT_ID,
     device_platform: "web",
     region: "CN",
-    webId: WEB_ID,
+    webId: deviceIdentity(token).webId,
     ...(options.params || {}),
   };
 

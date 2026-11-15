@@ -301,7 +301,7 @@
         <div class="account-layout">
           <div class="form-card">
             <h3>添加账号</h3>
-            <p>支持添加多个豆包（doubao.com）或即梦账号。Cookie 加密存储，不会回显到页面。</p>
+            <p>推荐「扫码登录」：服务端打开官方登录页，用手机 App 扫码后自动保存。也可以手动粘贴 Cookie。凭据加密存储，不会回显到页面。</p>
             <div class="form-group">
               <label for="account-provider">所属平台</label>
               <select id="account-provider" onchange="onAccountProviderChange()">
@@ -310,12 +310,22 @@
               </select>
             </div>
             <div class="form-group"><label for="account-name">账号名称</label><input id="account-name" type="text" placeholder="例如：豆包号 1、豆包号 2" /></div>
-            <div class="form-group"><label for="account-cookie">Cookie / SessionID</label><textarea id="account-cookie" rows="5" placeholder="粘贴 www.doubao.com 包含 sessionid 的完整 Cookie（建议含 ttwid、passport_csrf_token），或直接填 sessionid"></textarea></div>
-            <button class="btn btn-primary" onclick="createAccount()">保存到账号池</button>
+            <button class="btn btn-primary" onclick="startQrLogin()" style="width:100%;margin-bottom:16px">扫码登录（推荐）</button>
+            <div class="form-group"><label for="account-cookie">或手动填写 Cookie / SessionID</label><textarea id="account-cookie" rows="5" placeholder="粘贴 www.doubao.com 包含 sessionid 的完整 Cookie（建议含 ttwid、passport_csrf_token），或直接填 sessionid"></textarea></div>
+            <button class="btn btn-secondary" onclick="createAccount()">保存到账号池</button>
           </div>
           <div class="panel account-table-panel"><div class="panel-head"><div><h3>账号列表</h3><p>按平台隔离调度；单号触发限额自动冷却并切换下一账号</p></div></div><div class="notice">获取豆包 Cookie：浏览器登录 <code>https://www.doubao.com/chat/</code> → F12 网络面板任选请求 → 复制请求头中的完整 <code>Cookie</code> 值粘贴到左侧即可。</div><div class="table-scroll"><table><thead><tr><th>平台</th><th>名称</th><th>凭证</th><th>状态</th><th>可用额度/积分</th><th>套餐/详情</th><th>操作</th></tr></thead><tbody id="accounts-table"></tbody></table></div></div>
         </div>
       </section>
+
+      <div id="qr-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.6);align-items:center;justify-content:center">
+        <div class="panel" style="width:min(960px,96vw);max-height:96vh;overflow:auto;padding:18px">
+          <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center"><div><h3>扫码登录</h3><p id="qr-status">正在打开登录页…</p></div><button class="btn btn-secondary" onclick="closeQrLogin(true)">取消</button></div>
+          <div class="notice">下方是服务端浏览器的实时画面，可以直接点击、拖动。即梦：关闭弹窗 → 点「登录」→ 勾选协议 → 点抖音图标扫码；豆包：点「登录」后用豆包 App 扫码。登录成功后自动保存到账号池。</div>
+          <img id="qr-screen" alt="登录画面" style="width:100%;cursor:pointer;border-radius:8px;user-select:none;-webkit-user-drag:none" draggable="false" />
+          <div style="display:flex;gap:8px;margin-top:10px"><input id="qr-text" type="text" placeholder="需要输入手机号 / 验证码时在这里输入" style="flex:1" /><button class="btn btn-secondary" onclick="sendQrText()">输入</button><button class="btn btn-secondary" onclick="sendQrInput({ type: 'key', key: 'Enter' })">回车</button><button class="btn btn-secondary" onclick="sendQrInput({ type: 'key', key: 'Backspace' })">退格</button></div>
+        </div>
+      </div>
 
       <section id="tab-stats" class="tab-content"><div class="section-heading"><div><h2>运行概览</h2><p>查看服务调用量与模型使用情况。</p></div><button class="btn btn-secondary" onclick="loadStats()">刷新数据</button></div><div class="stats-grid"><div class="stat-card"><div class="stat-label">总调用次数</div><div id="total-calls" class="stat-value accent">0</div></div><div class="stat-card"><div class="stat-label">消耗积分</div><div id="total-credits" class="stat-value">0</div></div><div class="stat-card"><div class="stat-label">启用中的密钥</div><div id="active-keys" class="stat-value green">0</div></div><div class="stat-card"><div class="stat-label">使用过的模型</div><div id="models-used" class="stat-value">0</div></div></div><div class="panel" style="margin-bottom:18px"><div class="panel-head"><h3>API 密钥调用统计</h3></div><div class="table-scroll"><table><thead><tr><th>密钥</th><th>调用次数</th><th>消耗积分</th><th>剩余积分</th><th>最近使用</th></tr></thead><tbody id="key-stats-table"></tbody></table></div></div><div class="panel"><div class="panel-head"><h3>模型使用统计</h3></div><div class="table-scroll"><table><thead><tr><th>模型</th><th>调用次数</th><th>消耗积分</th></tr></thead><tbody id="model-stats-table"></tbody></table></div></div></section>
 
@@ -477,11 +487,43 @@
       }
       function apiError(payload, fallback) { return payload?.message || payload?.error || payload?.data?.message || fallback; }
       function isApiFailure(payload) { return payload && typeof payload.code === "number" && payload.code !== 0; }
-      async function loadAccounts() { try { const res = await fetch("/account-pool/", { credentials: "include" }); const payload = await res.json(); if (!res.ok || isApiFailure(payload) || !Array.isArray(payload)) { showToast(apiError(payload, "账号列表读取失败")); return; } const accounts = payload; const active = accounts.filter((a) => a.enabled).length; $("account-total").textContent = accounts.length; $("account-active").textContent = active; $("account-disabled").textContent = accounts.length - active; $("accounts-table").innerHTML = accounts.map((a) => `<tr><td>${providerBadge(a.provider)}</td><td><strong>${esc(a.name || "未命名账号")}</strong></td><td><code>${esc(a.credentialPreview || "********")}</code></td><td>${accountStateBadge(a)}</td><td>${esc(a.status?.totalCredit ?? a.status?.freeCredit ?? "—")}</td><td title="${esc(a.status?.error || "")}">${esc(membershipText(a.status?.membership, a.status?.error))}</td><td><div class="row-actions"><button class="btn btn-secondary" onclick="setAccountStatus('${esc(a.id)}', ${!a.enabled})">${a.enabled ? "停用" : "启用"}</button><button class="btn btn-secondary" onclick="refreshAccount('${esc(a.id)}')">刷新状态</button><button class="btn btn-danger" onclick="deleteAccount('${esc(a.id)}')">删除</button></div></td></tr>`).join("") || emptyRow(7, "还没有账号，请从左侧添加豆包或即梦账号"); } catch (e) { console.error(e); showToast("账号列表读取失败"); } }
+      async function loadAccounts() { try { const res = await fetch("/account-pool/", { credentials: "include" }); const payload = await res.json(); if (!res.ok || isApiFailure(payload) || !Array.isArray(payload)) { showToast(apiError(payload, "账号列表读取失败")); return; } const accounts = payload; const active = accounts.filter((a) => a.enabled).length; $("account-total").textContent = accounts.length; $("account-active").textContent = active; $("account-disabled").textContent = accounts.length - active; $("accounts-table").innerHTML = accounts.map((a) => `<tr><td>${providerBadge(a.provider)}</td><td><strong>${esc(a.name || "未命名账号")}</strong></td><td><code>${esc(a.credentialPreview || "********")}</code></td><td>${accountStateBadge(a)}</td><td>${esc(a.status?.totalCredit ?? a.status?.freeCredit ?? "—")}</td><td title="${esc(a.status?.error || "")}">${esc(membershipText(a.status?.membership, a.status?.error))}</td><td><div class="row-actions"><button class="btn btn-secondary" onclick="setAccountStatus('${esc(a.id)}', ${!a.enabled})">${a.enabled ? "停用" : "启用"}</button><button class="btn btn-secondary" onclick="refreshAccount('${esc(a.id)}')">刷新状态</button><button class="btn btn-secondary" onclick="startQrLogin('${esc(a.id)}', '${esc(a.provider)}')">重新扫码</button><button class="btn btn-danger" onclick="deleteAccount('${esc(a.id)}')">删除</button></div></td></tr>`).join("") || emptyRow(7, "还没有账号，请从左侧添加豆包或即梦账号"); } catch (e) { console.error(e); showToast("账号列表读取失败"); } }
       async function createAccount() { const provider = $("account-provider").value, name = $("account-name").value.trim(), cookie = $("account-cookie").value.trim(); if (!name || !cookie) return showToast("请填写账号名称和 Cookie"); try { const res = await fetch("/account-pool/", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, provider, cookie }) }); const data = await res.json(); if (!res.ok || isApiFailure(data)) return showToast(apiError(data, "添加账号失败")); $("account-name").value = ""; $("account-cookie").value = ""; await loadAccounts(); showToast("账号已加入账号池"); } catch (e) { console.error(e); showToast("添加账号失败，请检查服务日志"); } }
       async function setAccountStatus(id, enabled) { const res = await fetch(`/account-pool/${id}/enabled`, { method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); if (res.ok) { loadAccounts(); showToast(enabled ? "账号已启用" : "账号已停用"); } }
       async function refreshAccount(id) { const res = await fetch(`/account-pool/${id}/refresh-status`, { method: "POST", credentials: "include" }); const data = await res.json(); if (!res.ok || isApiFailure(data)) showToast(apiError(data, "状态查询失败")); else showToast("账号状态已更新"); loadAccounts(); }
       async function deleteAccount(id) { if (!confirm("确定从账号池删除这个账号吗？")) return; const res = await fetch(`/account-pool/${id}`, { method: "DELETE", credentials: "include" }); if (res.ok) { loadAccounts(); showToast("账号已删除"); } }
+      // ---- 扫码登录：显示服务端浏览器实时画面并转发点击/输入 ----
+      let qrLogin = null;
+      async function startQrLogin(accountId, provider) {
+        if (qrLogin) return showToast("已有扫码登录进行中");
+        provider = provider || $("account-provider").value;
+        $("qr-status").textContent = "正在打开登录页，首次启动浏览器可能需要十几秒…"; $("qr-screen").removeAttribute("src"); $("qr-modal").style.display = "flex";
+        try {
+          const res = await fetch("/dashboard/qr-login", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, name: accountId ? undefined : $("account-name").value.trim(), accountId }) });
+          const data = await res.json();
+          if (!res.ok || isApiFailure(data)) { $("qr-modal").style.display = "none"; return showToast(apiError(data, "启动扫码登录失败")); }
+          qrLogin = { id: data.id, timer: setInterval(pollQrLogin, 1500) };
+          $("qr-status").textContent = accountId ? "请扫码登录同一个账号，成功后自动更新凭据" : "请在画面中打开二维码并用手机 App 扫码";
+          refreshQrScreen();
+        } catch (e) { console.error(e); $("qr-modal").style.display = "none"; showToast("启动扫码登录失败，请检查服务日志"); }
+      }
+      function refreshQrScreen() { if (qrLogin) $("qr-screen").src = `/dashboard/qr-login/${qrLogin.id}/screen?t=${Date.now()}`; }
+      $("qr-screen").onload = () => setTimeout(refreshQrScreen, 700);
+      $("qr-screen").onerror = () => setTimeout(refreshQrScreen, 1500);
+      async function pollQrLogin() {
+        if (!qrLogin) return;
+        const res = await fetch(`/dashboard/qr-login/${qrLogin.id}`, { credentials: "include" }); const data = await res.json().catch(() => ({}));
+        if (data.status === "success") { closeQrLogin(false); showToast(`登录成功，已保存账号「${data.account?.name || ""}」`); $("account-name").value = ""; loadAccounts(); }
+        else if (data.status === "expired" || data.status === "error" || res.status === 404) { closeQrLogin(false); showToast(data.error || "扫码登录已结束"); }
+      }
+      function closeQrLogin(cancel) { if (qrLogin) { clearInterval(qrLogin.timer); if (cancel) fetch(`/dashboard/qr-login/${qrLogin.id}`, { method: "DELETE", credentials: "include" }); } qrLogin = null; $("qr-modal").style.display = "none"; $("qr-screen").removeAttribute("src"); }
+      async function sendQrInput(input) { if (!qrLogin) return; const res = await fetch(`/dashboard/qr-login/${qrLogin.id}/input`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }); if (!res.ok) showToast(apiError(await res.json().catch(() => ({})), "操作失败")); }
+      function sendQrText() { const text = $("qr-text").value; if (text) { sendQrInput({ type: "text", text }); $("qr-text").value = ""; } }
+      // 画面坐标换算成页面视口坐标；按下-抬起距离较大视为拖动（滑块等）
+      function qrPoint(e) { const img = $("qr-screen"), r = img.getBoundingClientRect(); return { x: Math.round((e.clientX - r.left) * img.naturalWidth / r.width), y: Math.round((e.clientY - r.top) * img.naturalHeight / r.height) }; }
+      let qrDown = null;
+      $("qr-screen").addEventListener("mousedown", (e) => { e.preventDefault(); qrDown = qrPoint(e); });
+      $("qr-screen").addEventListener("mouseup", (e) => { if (!qrDown) return; const p = qrPoint(e), from = qrDown; qrDown = null; if (Math.hypot(p.x - from.x, p.y - from.y) > 8) sendQrInput({ type: "drag", x: from.x, y: from.y, toX: p.x, toY: p.y }); else sendQrInput({ type: "click", x: p.x, y: p.y }); });
 
       async function loadStats() { try { const res = await fetch("/dashboard/stats", { credentials: "include" }); if (!res.ok) return; const data = await res.json(); $("total-calls").textContent = data.totals?.total_calls || 0; $("total-credits").textContent = data.totals?.total_credits || 0; $("active-keys").textContent = data.keyStats?.length || 0; $("models-used").textContent = data.modelStats?.length || 0; $("key-stats-table").innerHTML = data.keyStats?.map((k) => `<tr><td><code>${esc(k.key_preview)}</code></td><td>${esc(k.total_calls)}</td><td>${esc(k.total_credits)}</td><td>${esc(k.remaining_credits || 0)}</td><td>${dateText(k.last_used)}</td></tr>`).join("") || emptyRow(5); $("model-stats-table").innerHTML = data.modelStats?.map((m) => `<tr><td>${esc(m.model)}</td><td>${esc(m.total_calls)}</td><td>${esc(m.total_credits)}</td></tr>`).join("") || emptyRow(3); } catch (e) { console.error(e); } }
       async function loadLogs() { try { const level = $("log-level").value, res = await fetch(`/dashboard/logs?level=${level}&limit=200`, { credentials: "include" }); if (!res.ok) return; const logs = await res.json(); $("log-container").innerHTML = logs.map((log) => `<div class="log-entry"><span class="log-time">${esc(log.created_at)}</span><span class="log-level ${esc(log.level)}">${esc(log.level)}</span><span class="log-message">${esc(log.message)}</span></div>`).join("") || `<div class="loading">暂无日志</div>`; } catch (e) { console.error(e); } }

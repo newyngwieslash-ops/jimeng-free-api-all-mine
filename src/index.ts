@@ -6,6 +6,7 @@ import "@/lib/initialize.ts";
 import server from "@/lib/server.ts";
 import routes from "@/api/routes/index.ts";
 import logger from "@/lib/logger.ts";
+import { resumeVideoTasks } from "@/api/controllers/video-tasks.ts";
 
 const startupTime = performance.now();
 
@@ -20,6 +21,8 @@ const startupTime = performance.now();
 
   server.attachRoutes(routes);
   await server.listen();
+  // 上次进程未完成的视频任务：能续查的继续轮询，不能的标记失败
+  resumeVideoTasks();
 
   config.service.bindAddress &&
     logger.success("Service bind address:", config.service.bindAddress);

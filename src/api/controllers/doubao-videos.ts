@@ -1004,15 +1004,16 @@ async function pollConversationVideo(
         if (finalUrl) return finalUrl;
       }
     } catch (err) {
-      if (err instanceof APIException) throw err;
+      // 已提交生成任务，失败不能换号重提（会重复扣次数）
+      if (err instanceof APIException) throw Object.assign(err, { noFailover: true });
     }
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
-  throw new APIException(
+  throw Object.assign(new APIException(
     EX.API_VIDEO_GENERATION_FAILED,
     `等待豆包视频渲染超时（会话 https://www.doubao.com/chat/${convId} ），可稍后在豆包会话中查看`
-  );
+  ), { noFailover: true });
 }
 
 export function getDoubaoVideosDir(): string {
@@ -1029,7 +1030,16 @@ export function resolveLocalVideoPath(filename: string): string | null {
   return path.dirname(full) === dir ? full : null;
 }
 
-export async function cacheDoubaoVideoLocally(remoteUrl: string, baseOrigin?: string): Promise<string> {
+/**
+ * 把上游视频下载到本地并返回本服务的文件地址（上游签名链接会过期）；失败时回退远程直链
+ *
+ * @param site 来源站点，决定文件名前缀与下载时的 Origin/Referer
+ */
+export async function cacheVideoLocally(
+  remoteUrl: string,
+  baseOrigin?: string,
+  site: "doubao" | "jimeng" = "doubao"
+): Promise<string> {
   if (!remoteUrl || !/^https?:\/\//i.test(remoteUrl)) return remoteUrl;
   let parsedUrl: URL;
   try {
@@ -1051,16 +1061,17 @@ export async function cacheDoubaoVideoLocally(remoteUrl: string, baseOrigin?: st
     const dir = getDoubaoVideosDir();
     await fs.ensureDir(dir);
     const hash = crypto.createHash("sha1").update(`${parsedUrl.origin}${parsedUrl.pathname}`).digest("hex").slice(0, 16);
-    const filename = `doubao_${hash}.mp4`;
+    const filename = `${site}_${hash}.mp4`;
     const filePath = path.join(dir, filename);
+    const siteOrigin = site === "jimeng" ? "https://jimeng.jianying.com" : BASE_URL;
 
     if (!(await fs.pathExists(filePath))) {
       const res = await axios.get<ArrayBuffer>(remoteUrl, {
         responseType: "arraybuffer",
         headers: {
           "User-Agent": USER_AGENT,
-          Origin: BASE_URL,
-          Referer: `${BASE_URL}/`,
+          Origin: siteOrigin,
+          Referer: `${siteOrigin}/`,
         },
         timeout: 120_000,
         maxContentLength: 300 * 1024 * 1024,
@@ -1076,7 +1087,7 @@ export async function cacheDoubaoVideoLocally(remoteUrl: string, baseOrigin?: st
     const origin = (baseOrigin || defaultOrigin).replace(/\/+$/, "");
     return `${origin}/v1/videos/files/${filename}`;
   } catch (err: any) {
-    logger.warn(`豆包视频本地落盘缓存失败，回退远程直链: ${err?.message || err}`);
+    logger.warn(`视频本地落盘缓存失败，回退远程直链: ${err?.message || err}`);
     return remoteUrl;
   }
 }
@@ -1091,6 +1102,8 @@ async function generateRemoteDoubaoVideo(
     filePaths?: string[];
     pollIntervalMs?: number;
     pollTimeoutMs?: number;
+    /** 拿到豆包会话 ID（即任务已提交）时回调，用于持久化以便重启后续查 */
+    onSubmitted?: (convId: string) => void;
   } = {},
   rawCredential: string
 ): Promise<string> {
@@ -1145,6 +1158,7 @@ async function generateRemoteDoubaoVideo(
       }
 
       if (convId) {
+        options.onSubmitted?.(String(convId));
         return await pollConversationVideo(convId, cookieHeader, msToken, pollIntervalMs, pollTimeoutMs);
       }
       logger.warn(`豆包新端点未返回有效会话 ID（回复: ${agentText.slice(0, 100)}），回退 samantha 通道`);
@@ -1269,6 +1283,7 @@ async function generateRemoteDoubaoVideo(
       `豆包视频未创建有效会话（回复: ${parsed.agentText.slice(0, 140) || "空"}）`
     );
   }
+  options.onSubmitted?.(String(convId));
   return await pollConversationVideo(convId, cookieHeader, msToken, pollIntervalMs, pollTimeoutMs);
 }
 
@@ -1283,11 +1298,30 @@ export async function generateDoubaoVideo(
     pollIntervalMs?: number;
     pollTimeoutMs?: number;
     baseOrigin?: string;
+    onSubmitted?: (convId: string) => void;
   } = {},
   rawCredential: string
 ): Promise<string> {
   const remoteUrl = await generateRemoteDoubaoVideo(model, prompt, options, rawCredential);
-  return await cacheDoubaoVideoLocally(remoteUrl, options.baseOrigin);
+  return await cacheVideoLocally(remoteUrl, options.baseOrigin);
+}
+
+/**
+ * 服务重启后按会话 ID 续查豆包视频（不会重新提交）
+ *
+ * @param convId 提交时持久化的豆包会话 ID
+ * @param rawCredential 提交该任务的账号 Cookie
+ */
+export async function resumeDoubaoVideo(
+  convId: string,
+  rawCredential: string,
+  options: { pollIntervalMs?: number; pollTimeoutMs?: number; baseOrigin?: string } = {}
+): Promise<string> {
+  const { cookieHeader, msToken } = resolveDoubaoCookie(rawCredential);
+  const remoteUrl = await pollConversationVideo(
+    convId, cookieHeader, msToken, options.pollIntervalMs ?? 8_000, options.pollTimeoutMs ?? 600_000
+  );
+  return await cacheVideoLocally(remoteUrl, options.baseOrigin);
 }
 
 export async function getDoubaoAccountStatus(rawCredential: string): Promise<{

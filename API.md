@@ -69,6 +69,13 @@ Authorization: Bearer jm_HmvKHn58jRdsq2Po-weIRZeZPnTfIFL_nU9DUWN-XPc
 
 > 注意：`jm_...` Key 必须先在管理端创建并关联账号，未注册的 Key 会返回 `API key is invalid or disabled`。
 
+**扫码添加账号（推荐）**：控制台「账号池」→ 选择平台 →「扫码登录」。服务端浏览器打开官方登录页，控制台显示实时画面（可直接点击/拖动），用手机扫码后自动加密保存整站 Cookie；账号掉线时在列表中点「重新扫码」即可更新凭据。
+
+- 豆包：画面自动打开登录框，用豆包 / 飞书 App 扫码；
+- 即梦：画面自动打开登录框，勾选协议 → 点抖音图标 → 用抖音 App 扫弹出的二维码。
+
+需要 `playwright-core` 与 Chrome / Edge / Chromium（与浏览器传输共用，Docker 镜像已内置）。
+
 ### 2.3 环境变量
 
 账号池凭据使用 AES-256-GCM 加密存储，启动服务前必须配置密钥，且保持稳定（更换后无法解密旧账号）：
@@ -110,7 +117,8 @@ curl http://localhost:8000/ping
 |---|---|---|---|
 | GET | `/ping` | 健康检查 | 无 |
 | POST | `/v1/images/generations` | 图像生成（支持参考图） | 必填 |
-| POST | `/v1/videos/generations` | 视频生成（支持首尾帧） | 必填 |
+| POST | `/v1/videos/generations` | 视频生成（支持首尾帧、异步任务、幂等键） | 必填 |
+| GET | `/v1/videos/generations/{id}` | 查询异步视频任务 | 必填 |
 | POST | `/v1/chat/completions` | OpenAI 兼容对话补全 | 必填 |
 | GET | `/v1/models` | 模型列表 | 可选（有则实时拉取官网） |
 | GET | `/v1/account/status` | 账号积分/会员状态 | 必填 |
@@ -210,10 +218,42 @@ curl -X POST http://localhost:8000/v1/images/generations \
 | `duration` | integer | 否 | 模型默认 | 时长秒数；Seedance 2.0 系列默认 5 秒，支持 4~15 秒；其他模型通常支持 5 或 10 秒 |
 | `file_paths` | string[] | 否 | `[]` | 首尾帧参考图：本地路径 / URL / base64 |
 | `response_format` | string | 否 | `url` | `url` 或 `b64_json` |
+| `async` | boolean | 否 | `false` | `true` 时立即返回任务对象，之后用 `GET /v1/videos/generations/{id}` 查询结果（生产环境推荐） |
+| `idempotency_key` | string | 否 | - | 幂等键（也可用请求头 `Idempotency-Key`）。同一调用方重复提交同一个 key 只会生成一次，返回同一个任务，客户端超时重试不会重复扣积分 |
+| `allow_downgrade` | boolean | 否 | `false` | 积分不足时是否允许在同一账号上自动降分辨率 / 时长。默认不降级，直接切换账号池的下一个账号 |
 
 同样支持 `multipart/form-data` 上传首尾帧图片。
 
-#### 请求示例
+生成完成后视频会下载到服务本地（`DB_PATH` 同级的 `videos/` 目录），返回的 `url` 指向本服务的 `/v1/videos/files/{filename}`，避免上游签名链接过期。下载失败时回退为上游直链。
+
+#### 异步模式（推荐）
+
+```bash
+# 1) 提交，立即返回任务
+curl -X POST http://localhost:8000/v1/videos/generations \
+  -H "Authorization: Bearer jm_xxx" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-20261115-001" \
+  -d '{ "model": "jimeng-video-seedance-2.0", "prompt": "女孩在沙滩奔跑", "async": true }'
+# => { "id": "vt_xxx", "object": "video.generation.task", "status": "running", "url": null, ... }
+
+# 2) 轮询（建议 5~10 秒一次），status: running | succeeded | failed
+curl http://localhost:8000/v1/videos/generations/vt_xxx -H "Authorization: Bearer jm_xxx"
+# => { "id": "vt_xxx", "status": "succeeded", "url": "http://localhost:8000/v1/videos/files/jimeng_xxx.mp4", "error": null, ... }
+```
+
+只能用提交时的同一个 Authorization 查询任务。服务重启后：已提交到上游的账号池任务会用原账号继续查询结果，不会重新提交（即梦按历史记录 ID，豆包按会话 ID）；其余未完成任务标记为 `failed` 并在 `error` 中说明。
+
+#### 生产相关环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `ACCOUNT_MAX_CONCURRENCY` | `2` | 单账号同时执行的任务数上限；可在账号 `metadata.maxConcurrency` 单独覆盖 |
+| `ACCOUNT_WAIT_TIMEOUT_MS` | `300000` | 所有账号都满载时排队等待的最长时间 |
+| `ACCOUNT_REFRESH_AFTER_USE` | `true` | 每次生成后刷新账号积分；当天已确认积分为 0 的账号会被跳过，次日自动恢复 |
+| `VIDEO_POLL_TIMEOUT_MS` | `1800000` | 单个视频任务轮询上游结果的最长时间 |
+| `JIMENG_BROWSER_MAX_CONTEXTS` | `4` | 浏览器传输同时保留的账号上下文数（每个账号独立上下文，互不串号，不同账号并行） |
+
+#### 请求示例（同步，等待出片后返回）
 
 ```bash
 curl -X POST http://localhost:8000/v1/videos/generations \
@@ -231,9 +271,10 @@ curl -X POST http://localhost:8000/v1/videos/generations \
 ```json
 {
   "created": 1787794197,
+  "task_id": "vt_xxx",
   "data": [
     {
-      "url": "https://v3-web.douyinvod.com/...",
+      "url": "http://localhost:8000/v1/videos/files/jimeng_xxx.mp4",
       "revised_prompt": "女孩在沙滩奔跑，夕阳逆光"
     }
   ]

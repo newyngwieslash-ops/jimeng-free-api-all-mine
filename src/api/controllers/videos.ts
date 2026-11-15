@@ -6,6 +6,7 @@ import util from "@/lib/util.ts";
 import { getCredit, receiveCredit, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
 import { JimengModelConfig, resolveVideoModelConfig } from "./models.ts";
+import { cacheVideoLocally } from "./doubao-videos.ts";
 
 const DEFAULT_ASSISTANT_ID = 513695;
 export const DEFAULT_MODEL = "jimeng-video-seedance-2.0";
@@ -339,6 +340,7 @@ export async function generateVideo(
     resolution = "720p",
     duration,
     filePaths = [],
+    onSubmitted,
   }: {
     ratio?: string;
     resolution?: string;
@@ -346,6 +348,8 @@ export async function generateVideo(
     filePaths?: string[];
     width?: number;
     height?: number;
+    /** 任务已提交上游时回调（用于持久化 historyId） */
+    onSubmitted?: (historyId: string) => void;
   },
   refreshToken: string
 ) {
@@ -594,19 +598,33 @@ export async function generateVideo(
   const historyId = aigc_data.history_record_id;
   if (!historyId)
     throw new APIException(EX.API_VIDEO_GENERATION_FAILED, "记录ID不存在");
+  onSubmitted?.(historyId);
+  return await pollVideoResult(historyId, refreshToken);
+}
+
+/**
+ * 按 historyId 轮询视频结果（服务重启后续查未完成任务也用它）
+ *
+ * @param historyId 上游历史记录ID
+ * @param refreshToken 提交该任务的账号 token
+ */
+export async function pollVideoResult(historyId: string, refreshToken: string): Promise<string> {
+  // 拿到 historyId 即已提交上游（可能已扣积分），之后的失败都不能换号重提
+  const submittedError = (message: string) =>
+    Object.assign(new APIException(EX.API_VIDEO_GENERATION_FAILED, message), { noFailover: true });
 
   // 轮询获取结果
   let status = 20,
     failCode,
     item_list = [];
   let retryCount = 0;
-  const maxRetries = 60; // 20 mins
+  const deadline = Date.now() + (Number(process.env.VIDEO_POLL_TIMEOUT_MS) || 30 * 60_000);
 
   await new Promise((resolve) => setTimeout(resolve, 5000));
 
   logger.info(`开始轮询视频生成结果，历史ID: ${historyId}`);
 
-  while (VIDEO_PROCESSING_STATES.includes(status) && retryCount < maxRetries) {
+  while (VIDEO_PROCESSING_STATES.includes(status) && Date.now() < deadline) {
     try {
       const requestUrl = "/mweb/v1/get_history_by_ids";
       const requestData = { history_ids: [historyId] };
@@ -658,10 +676,7 @@ export async function generateVideo(
       if (tempVideoUrl) return tempVideoUrl; // Found it
 
       if (status === 30) {
-        throw new APIException(
-          EX.API_VIDEO_GENERATION_FAILED,
-          `生成失败: ${failCode}`
-        );
+        throw submittedError(`生成失败: ${failCode}`);
       }
 
       if (VIDEO_PROCESSING_STATES.includes(status)) {
@@ -671,7 +686,8 @@ export async function generateVideo(
         );
       }
     } catch (e) {
-      if (e instanceof APIException) throw e;
+      // 只有上游明确判定失败才结束；轮询中的偶发错误（含上游业务错误）继续重试
+      if (e?.noFailover) throw e;
       logger.error(`轮询出错: ${e.message}`);
       retryCount++;
       await new Promise((r) => setTimeout(r, 5000));
@@ -679,23 +695,25 @@ export async function generateVideo(
   }
 
   // Timeout
-  if (retryCount >= maxRetries) {
-    throw new APIException(EX.API_VIDEO_GENERATION_FAILED, "超时");
+  if (Date.now() >= deadline && VIDEO_PROCESSING_STATES.includes(status)) {
+    throw submittedError(`超时（即梦历史ID ${historyId}，可稍后在即梦网页端查看）`);
   }
 
   // Final Extraction (Redundant but safe)
   const finalUrl = extractVideoUrlFromItemList(item_list);
   if (finalUrl) return finalUrl;
 
-  throw new APIException(
-    EX.API_VIDEO_GENERATION_FAILED,
+  throw submittedError(
     `视频生成结束但未返回可用URL，状态码: ${status}${failCode ? `，失败码: ${failCode}` : ""}`
   );
 }
 
 /**
- * 带自动降级重试的视频生成
- * 如果积分不足，自动降低分辨率和时长重试
+ * 视频生成（API / 控制台入口）
+ *
+ * 默认严格按请求规格生成：积分不足直接报错，由账号池切换到下一个账号；
+ * 仅当 allowDowngrade 为 true 时才在同一账号上降分辨率/时长重试。
+ * 出片后立即下载到本地，避免上游签名链接过期。
  */
 export async function generateVideoWithRetry(
   _model: string,
@@ -705,6 +723,31 @@ export async function generateVideoWithRetry(
     resolution?: string;
     duration?: number;
     filePaths?: string[];
+    allowDowngrade?: boolean;
+    baseOrigin?: string;
+    onSubmitted?: (historyId: string) => void;
+  },
+  refreshToken: string
+): Promise<string> {
+  const remoteUrl = options.allowDowngrade
+    ? await generateVideoWithDowngrade(_model, prompt, options, refreshToken)
+    : await generateVideo(_model, prompt, options, refreshToken);
+  return await cacheVideoLocally(remoteUrl, options.baseOrigin, "jimeng");
+}
+
+/**
+ * 带自动降级重试的视频生成
+ * 如果积分不足，自动降低分辨率和时长重试
+ */
+async function generateVideoWithDowngrade(
+  _model: string,
+  prompt: string,
+  options: {
+    ratio?: string;
+    resolution?: string;
+    duration?: number;
+    filePaths?: string[];
+    onSubmitted?: (historyId: string) => void;
   },
   refreshToken: string
 ): Promise<string> {

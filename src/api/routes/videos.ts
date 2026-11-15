@@ -3,11 +3,16 @@ import fs from 'fs-extra';
 
 import Request from '@/lib/request/Request.ts';
 import Response from '@/lib/response/Response.ts';
-import { generateVideoWithRetry, DEFAULT_MODEL } from '@/api/controllers/videos.ts';
-import { generateDoubaoVideo, isDoubaoVideoModel, resolveLocalVideoPath } from '@/api/controllers/doubao-videos.ts';
-import { executeWithCredentialFailover } from '@/api/controllers/auth.ts';
+import { DEFAULT_MODEL } from '@/api/controllers/videos.ts';
+import { resolveLocalVideoPath } from '@/api/controllers/doubao-videos.ts';
+import { getVideoTaskForOwner, publicVideoTask, startVideoTask } from '@/api/controllers/video-tasks.ts';
 import util from '@/lib/util.ts';
-import db from '@/lib/database.ts';
+import db, { getVideoTask } from '@/lib/database.ts';
+
+function localVideoPathFromUrl(url: string): string | null {
+    const filename = url.match(/\/v1\/videos\/files\/([^/?#]+)$/)?.[1];
+    return filename ? resolveLocalVideoPath(filename) : null;
+}
 
 function requestBaseOrigin(request: Request): string | undefined {
     const host = request.headers?.['x-forwarded-host'] || request.headers?.host;
@@ -31,6 +36,16 @@ export default {
     prefix: '/v1/videos',
 
     get: {
+
+        '/generations/:id': async (request: Request) => {
+            request.validate('headers.authorization', _.isString);
+            const task = getVideoTaskForOwner(
+                String(request.params?.id || ''),
+                db.taskOwnerHash(request.headers.authorization)
+            );
+            if (!task) return new Response({ error: '视频任务不存在' }, { statusCode: 404 });
+            return publicVideoTask(task);
+        },
 
         '/files/:filename': async (request: Request) => {
             const filename = String(request.params?.filename || '');
@@ -68,6 +83,9 @@ export default {
                 .validate('body.duration', v => _.isUndefined(v) || _.isInteger(v))
                 .validate('body.file_paths', v => _.isUndefined(v) || _.isArray(v))
                 .validate('body.response_format', v => _.isUndefined(v) || _.isString(v))
+                .validate('body.async', v => _.isUndefined(v) || _.isBoolean(v))
+                .validate('body.allow_downgrade', v => _.isUndefined(v) || _.isBoolean(v))
+                .validate('body.idempotency_key', v => _.isUndefined(v) || _.isString(v))
                 .validate('headers.authorization', _.isString);
 
             const {
@@ -77,8 +95,12 @@ export default {
                 resolution,
                 duration,
                 file_paths = [],
-                response_format = "url"
+                response_format = "url",
+                async: asyncMode = false,
+                allow_downgrade: allowDowngrade = false,
             } = request.body;
+            // 客户端超时重试时带同一个 key，不会重复提交上游扣积分
+            const idempotencyKey = request.body.idempotency_key || request.headers['idempotency-key'];
 
             // 处理文件上传
             const filePaths = [...file_paths];
@@ -87,30 +109,32 @@ export default {
                 Object.values(files).forEach(file => appendUploadedPaths(file, filePaths));
             }
 
-            const useDoubao = isDoubaoVideoModel(model);
-            const provider = useDoubao ? 'doubao' : 'jimeng';
-            const baseOrigin = requestBaseOrigin(request);
+            const { task, done } = startVideoTask({
+                authorization: request.headers.authorization,
+                ownerHash: db.taskOwnerHash(request.headers.authorization),
+                idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : undefined,
+                model,
+                prompt,
+                ratio,
+                resolution,
+                duration,
+                filePaths,
+                allowDowngrade,
+                baseOrigin: requestBaseOrigin(request),
+            });
 
-            const { result: videoUrl, credential } = await executeWithCredentialFailover(
-                request.headers.authorization,
-                provider,
-                (cred) => useDoubao
-                    ? generateDoubaoVideo(model, prompt, { ratio, resolution, duration, filePaths, baseOrigin }, cred.token)
-                    : generateVideoWithRetry(model, prompt, { ratio, resolution, duration, filePaths }, cred.token)
-            );
+            if (asyncMode) return publicVideoTask(getVideoTask(task.id) || task);
 
-            const statsKey = credential.managedKey || credential.accountName || credential.token;
-            try {
-                db.recordCall(statsKey, model, 0);
-                if (videoUrl) db.saveMedia('video', videoUrl, model, prompt, statsKey);
-            } catch (e) {
-                // 忽略数据库错误
-            }
+            const { videoUrl } = await done;
 
             if (response_format === "b64_json") {
-                const videoBase64 = await util.fetchFileBASE64(videoUrl);
+                const localPath = localVideoPathFromUrl(videoUrl);
+                const videoBase64 = localPath
+                    ? (await fs.readFile(localPath)).toString('base64')
+                    : await util.fetchFileBASE64(videoUrl);
                 return {
                     created: util.unixTimestamp(),
+                    task_id: task.id,
                     data: [{
                         b64_json: videoBase64,
                         revised_prompt: prompt
@@ -119,6 +143,7 @@ export default {
             }
             return {
                 created: util.unixTimestamp(),
+                task_id: task.id,
                 data: [{
                     url: videoUrl,
                     revised_prompt: prompt

@@ -223,6 +223,48 @@ if (!existingCols.some((c) => c.name === "provider")) {
 const roundRobinCursor: Record<AccountProvider, number> = { jimeng: 0, doubao: 0 };
 let membershipStatusProvider: MembershipStatusProvider | undefined;
 
+/** 每个账号正在执行的任务数（进程内）；上游对单账号并发生成有限制 */
+const inFlight = new Map<string, number>();
+const DEFAULT_MAX_CONCURRENCY = Math.max(1, Number(process.env.ACCOUNT_MAX_CONCURRENCY) || 2);
+
+/** 所有可用账号都已达到并发上限（区别于「没有可用账号」，调用方可以排队等待） */
+export class AccountBusyError extends Error {
+  constructor(provider: AccountProvider) {
+    super(`账号池的${provider === "doubao" ? "豆包" : "即梦"}账号都在生成中，已达单账号并发上限`);
+    this.name = "AccountBusyError";
+  }
+}
+
+function maxConcurrency(row: AccountRow): number {
+  const value = Number(parseJson<Record<string, unknown>>(row.metadata_json, {}).maxConcurrency);
+  return Number.isInteger(value) && value >= 1 ? value : DEFAULT_MAX_CONCURRENCY;
+}
+
+/** 上海时区日期（积分每日刷新按此判断） */
+function shanghaiDate(value: string | number | Date): string {
+  return new Date(new Date(value).getTime() + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
+/** 今天已确认积分为 0：跳过，次日自动恢复（生成时会领取每日积分） */
+function knownEmptyToday(row: AccountRow): boolean {
+  return row.total_credit !== null && row.total_credit <= 0 && !!row.status_checked_at
+    && shanghaiDate(row.status_checked_at) === shanghaiDate(Date.now());
+}
+
+export function acquireAccount(id: string): void {
+  inFlight.set(id, (inFlight.get(id) || 0) + 1);
+}
+
+export function releaseAccount(id: string): void {
+  const next = (inFlight.get(id) || 0) - 1;
+  if (next > 0) inFlight.set(id, next);
+  else inFlight.delete(id);
+}
+
+export function getInFlight(id: string): number {
+  return inFlight.get(id) || 0;
+}
+
 function toPublic(row: AccountRow): PublicAccount {
   return {
     id: row.id,
@@ -333,27 +375,41 @@ export function setAccountEnabled(id: string, enabled: boolean): PublicAccount {
 
 export function selectAccount(
   strategy: AccountSelectionStrategy = "least_failures",
-  options: { provider?: AccountProvider; excludeIds?: string[] } = {}
+  options: { provider?: AccountProvider; excludeIds?: string[]; checkConcurrency?: boolean } = {}
 ): AccountSelection {
   const provider = normalizeProvider(options.provider);
   const exclude = new Set(options.excludeIds || []);
-  const rows = (db
+  const eligible = (db
     .prepare(
       `SELECT * FROM ${TABLE} WHERE provider = ? AND enabled = 1 AND (cooldown_until IS NULL OR cooldown_until <= ?) ORDER BY failure_count ASC, last_used_at ASC`
     )
-    .all(provider, now()) as AccountRow[]).filter((r) => !exclude.has(r.id));
-  if (!rows.length) {
+    .all(provider, now()) as AccountRow[]).filter((r) => !exclude.has(r.id) && !knownEmptyToday(r));
+  if (!eligible.length) {
     throw new Error(provider === "doubao" ? "没有可用的豆包账号" : "没有可用的即梦账号");
   }
+  const rows = options.checkConcurrency
+    ? eligible.filter((r) => getInFlight(r.id) < maxConcurrency(r))
+    : eligible;
+  if (!rows.length) throw new AccountBusyError(provider);
   const row =
     strategy === "round_robin"
       ? rows[roundRobinCursor[provider]++ % rows.length]
       : rows[0];
   db.prepare(`UPDATE ${TABLE} SET last_used_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), row.id);
+  return { account: getAccount(row.id), ...credentialOf(row) };
+}
+
+function credentialOf(row: AccountRow): { credential: string; sessionId: string } {
   const raw = decrypt(row.credential_ciphertext);
   const sessionId = extractSessionId(raw, row.credential_kind);
   const credential = row.credential_kind === "sessionid" ? `sessionid=${sessionId}` : raw;
-  return { account: getAccount(row.id), credential, sessionId };
+  return { credential, sessionId };
+}
+
+/** Internal use only (e.g. resuming a task on the account that submitted it). Never return from an HTTP handler. */
+export function getAccountCredential(id: string): AccountSelection {
+  const row = getRow(id);
+  return { account: toPublic(row), ...credentialOf(row) };
 }
 
 export function markSuccess(id: string): PublicAccount {
@@ -412,6 +468,9 @@ export const accountPool = {
   delete: deleteAccount,
   setEnabled: setAccountEnabled,
   select: selectAccount,
+  acquire: acquireAccount,
+  release: releaseAccount,
+  getCredential: getAccountCredential,
   markSuccess,
   markFailure,
   refreshStatus,
