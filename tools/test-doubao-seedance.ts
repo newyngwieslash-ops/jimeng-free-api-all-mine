@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "fs-extra";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,7 @@ async function main() {
   const {
     buildVideoAbilityPayload,
     classifyDoubaoFailure,
+    decodeDoubaoMainUrl,
     extractCleanVideoUrl,
     extractVideoFromMessages,
     generateDoubaoVideo,
@@ -30,6 +32,7 @@ async function main() {
     parseAbilityAck,
     resolveDoubaoCookie,
     resolveLocalVideoPath,
+    resolveUnwatermarkedFromFallbackApi,
   } = await import("@/api/controllers/doubao-videos.ts");
 
   assert.equal(resolveLocalVideoPath("../evil.mp4"), null);
@@ -106,6 +109,25 @@ async function main() {
     }),
     "https://cdn.doubao.com/clean.mp4?lr=unwatermarked"
   );
+
+  // qAAB AES-128-CBC watermark-free master URL decryption & fallback_api SSRF guard checks
+  const testKeySeedBytes = Buffer.alloc(32, 0x42);
+  const testKeySeed = testKeySeedBytes.toString("base64");
+  const qaabSalt = Buffer.from(
+    "4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58",
+    "hex"
+  );
+  const d1 = crypto.createHash("sha512").update(testKeySeedBytes).digest();
+  const mat = crypto.createHash("sha512").update(Buffer.concat([d1, qaabSalt])).digest();
+  const cleanMasterUrl = "https://v3-vdl.doubao.com/master_clean_720p.mp4?lr=unwatermarked";
+  const cipher = crypto.createCipheriv("aes-128-cbc", mat.subarray(0, 16), mat.subarray(16, 32));
+  const encryptedBody = Buffer.concat([cipher.update(cleanMasterUrl, "ascii"), cipher.final()]);
+  const qaabToken = Buffer.concat([Buffer.from([0xa8, 0x00, 0x01, 0x00]), encryptedBody]).toString("base64");
+  assert.ok(qaabToken.startsWith("qAAB"));
+  assert.equal(decodeDoubaoMainUrl(qaabToken, testKeySeed), cleanMasterUrl);
+  assert.equal(await resolveUnwatermarkedFromFallbackApi("https://evil.example.com/video/fplay/1/tok/vid"), "");
+  assert.equal(await resolveUnwatermarkedFromFallbackApi("http://vas-lf-x.snssdk.com/video/fplay/1/tok/vid"), "");
+  const mockFallbackApi = `https://vas-lf-x.snssdk.com/video/fplay/1/mock_tok/v0200fg10000clean?aid=482431&codec_type=5&logo_type=video_gen_watermark_dyn&key_seed=${encodeURIComponent(testKeySeed)}`;
 
   // Error classification checks
   assert.equal(classifyDoubaoFailure("", "今日免费次数用完")?.errcode, -2009);
@@ -225,6 +247,7 @@ async function main() {
                             video: {
                               vid: "v0200fg10000clean",
                               video_model: JSON.stringify({
+                                fallback_api: mockFallbackApi,
                                 video_list: { video_1: { main_url: fallbackB64 } },
                               }),
                             },
@@ -259,8 +282,28 @@ async function main() {
 
   const origGet = axios.get.bind(axios);
   const fakeMp4Bytes = Buffer.from("00000018667479706d703432", "hex");
+  let fallbackApiCalled = false;
   (axios as any).get = async (url: string, config?: any) => {
-    if (url === "https://cdn.doubao.com/clean.mp4?lr=unwatermarked") {
+    if (url.startsWith("https://vas-lf-x.snssdk.com/video/fplay/1/mock_tok/v0200fg10000clean")) {
+      const parsedFUrl = new URL(url);
+      assert.equal(parsedFUrl.searchParams.get("channel"), "no");
+      assert.equal(parsedFUrl.searchParams.get("codec_type"), "8");
+      assert.equal(parsedFUrl.searchParams.get("logo_type"), "unwatermarked");
+      fallbackApiCalled = true;
+      return {
+        status: 200,
+        data: {
+          video_info: {
+            data: {
+              video_list: {
+                video_1: { main_url: qaabToken, vwidth: 1280, vheight: 720, bitrate: 24700000 },
+              },
+            },
+          },
+        },
+      };
+    }
+    if (url === cleanMasterUrl || url === "https://cdn.doubao.com/clean.mp4?lr=unwatermarked") {
       assert.equal(config?.headers?.Referer, "https://www.doubao.com/");
       return { status: 200, data: fakeMp4Bytes };
     }
@@ -342,6 +385,7 @@ async function main() {
   assert.equal(fileRes.status, 200);
   assert.ok((fileRes.headers.get("content-type") || "").includes("video/mp4"));
   assert.deepEqual(Buffer.from(await fileRes.arrayBuffer()), fakeMp4Bytes);
+  assert.equal(fallbackApiCalled, true);
   assert.equal(confirmCalled, true);
   assert.equal(accountPool.get(acc1.id).failureCount, 1);
   assert.ok(accountPool.get(acc1.id).cooldownUntil);

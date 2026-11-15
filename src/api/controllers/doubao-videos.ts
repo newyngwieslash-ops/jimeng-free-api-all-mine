@@ -373,12 +373,14 @@ export function parseSamanthaSse(rawSse: string): {
   convId: string;
   agentText: string;
   syncVideoUrl: string;
+  syncFallbackApi: string;
   asyncTaskId: string;
   errorMessage?: string;
 } {
   let convId = "";
   let agentText = "";
   let syncVideoUrl = "";
+  let syncFallbackApi = "";
   let asyncTaskId = "";
   let errorMessage: string | undefined;
 
@@ -432,7 +434,10 @@ export function parseSamanthaSse(rawSse: string): {
         const content = typeof msg.content === "string" ? JSON.parse(msg.content) : msg.content;
         const items = Array.isArray(content?.data) ? content.data : [content];
         for (const item of items) {
-          const decoded = decodeVideoModelInfo(item?.video_model).url || item?.video_url || item?.url || "";
+          const vmInfo = decodeVideoModelInfo(item?.video_model);
+          const decoded = vmInfo.url || item?.video_url || item?.url || "";
+          const fb = vmInfo.fallbackApi || findStringFieldDeep(item, "fallback_api");
+          if (fb && !syncFallbackApi) syncFallbackApi = fb;
           if (decoded) {
             syncVideoUrl = decoded;
             break;
@@ -443,31 +448,165 @@ export function parseSamanthaSse(rawSse: string): {
       }
     }
   }
-  return { convId, agentText: agentText.trim(), syncVideoUrl, asyncTaskId, errorMessage };
+  return { convId, agentText: agentText.trim(), syncVideoUrl, syncFallbackApi, asyncTaskId, errorMessage };
 }
 
-function decodeVideoModelInfo(videoModelRaw: unknown): { url: string; vid: string } {
-  if (!videoModelRaw) return { url: "", vid: "" };
+const QAAB_SALT = Buffer.from(
+  "4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58",
+  "hex"
+);
+const TRUSTED_FALLBACK_HOST_SUFFIXES = [".snssdk.com", ".douyinvod.com", ".dola.com", ".byteintlapi.com"];
+
+function findStringFieldDeep(node: unknown, fieldName: string, depth = 0): string {
+  if (!node || depth > 6) return "";
+  if (typeof node === "string") {
+    const trimmed = node.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return findStringFieldDeep(JSON.parse(trimmed), fieldName, depth + 1);
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findStringFieldDeep(item, fieldName, depth + 1);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof node === "object") {
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (k === fieldName && typeof v === "string" && v.trim()) return v.trim();
+      const found = findStringFieldDeep(v, fieldName, depth + 1);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
+function decodeBase64Loose(value: string): Buffer | null {
+  const input = String(value || "").trim();
+  if (!input) return null;
+  const mapA: Record<string, string> = { $: "_", "@": "/", "#": "." };
+  const mapB: Record<string, string> = { $: "+", "@": "/", "#": "=" };
+  for (const cand of [
+    input,
+    input.replace(/[$@#]/g, (c) => mapA[c] || c),
+    input.replace(/[$@#]/g, (c) => mapB[c] || c),
+  ]) {
+    if (!cand) continue;
+    const norm = cand.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = norm + "=".repeat((4 - (norm.length % 4)) % 4);
+    try {
+      return Buffer.from(padded, "base64");
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+function asciiHttpUrlFromBytes(buf: Buffer | null): string {
+  if (!buf || buf.length === 0) return "";
+  for (const b of buf) {
+    if (b !== 9 && b !== 10 && b !== 13 && (b < 32 || b > 126)) return "";
+  }
+  const s = buf.toString("ascii").trim();
+  return /^https?:\/\/.+/i.test(s) ? s : "";
+}
+
+function decryptAes128CbcUrl(payload: Buffer, key: Buffer, iv: Buffer): string {
+  if (!payload || payload.length === 0 || payload.length % 16 !== 0) return "";
+  for (const autoPad of [true, false]) {
+    try {
+      const dec = crypto.createDecipheriv("aes-128-cbc", key, iv);
+      dec.setAutoPadding(autoPad);
+      let out = Buffer.concat([dec.update(payload), dec.final()]);
+      if (!autoPad && out.length > 0) {
+        const pad = out[out.length - 1];
+        if (pad >= 1 && pad <= 16 && pad <= out.length && out.subarray(out.length - pad).every((x) => x === pad)) {
+          out = out.subarray(0, out.length - pad);
+        }
+      }
+      const u = asciiHttpUrlFromBytes(out);
+      if (u) return u;
+    } catch {
+      /* try next */
+    }
+  }
+  return "";
+}
+
+export function decodeDoubaoMainUrl(token: string, keySeed = ""): string {
+  const trimmed = String(token || "").trim();
+  if (!trimmed) return "";
+  if (/^https?:\/\/.+/i.test(trimmed)) return trimmed;
+
+  const b64 = decodeBase64Loose(trimmed);
+  const plain = asciiHttpUrlFromBytes(b64);
+  if (plain) return plain;
+
+  if (trimmed.startsWith("qAAB") && keySeed) {
+    const seedBytes = decodeBase64Loose(keySeed);
+    if (!b64 || !seedBytes || seedBytes.length === 0) return "";
+    const digest1 = crypto.createHash("sha512").update(seedBytes.subarray(0, 32)).digest();
+    const material = crypto.createHash("sha512").update(Buffer.concat([digest1, QAAB_SALT])).digest();
+    const key = material.subarray(0, 16);
+    const iv = material.subarray(16, 32);
+
+    const attempts: Array<[Buffer, Buffer, Buffer]> = [];
+    if (b64.length >= 4 && b64[0] === 0xa8 && b64[1] === 0x00 && b64[2] === 0x01 && b64[3] === 0x00) {
+      attempts.push([b64.subarray(4), key, iv], [b64.subarray(4), iv, key]);
+      if (b64.length > 36) {
+        attempts.push([b64.subarray(36), key, b64.subarray(20, 36)], [b64.subarray(36), key, iv]);
+      }
+    } else {
+      attempts.push([b64, key, iv]);
+    }
+    for (const [p, k, i] of attempts) {
+      const url = decryptAes128CbcUrl(p, k, i);
+      if (url) return url;
+    }
+  }
+  return "";
+}
+
+function decodeVideoModelInfo(videoModelRaw: unknown): { url: string; vid: string; fallbackApi: string } {
+  if (!videoModelRaw) return { url: "", vid: "", fallbackApi: "" };
   try {
     const vm = typeof videoModelRaw === "string" ? JSON.parse(videoModelRaw) : videoModelRaw;
     const vid = String((vm as any)?.video_id || "");
-    const list = (vm as any)?.video_list || {};
-    for (const key of ["video_1", "video_2", ...Object.keys(list)]) {
-      const mainB64 = list[key]?.main_url;
-      if (typeof mainB64 === "string" && mainB64) {
-        return { url: Buffer.from(mainB64, "base64").toString("utf8"), vid };
+    const fallbackApi = findStringFieldDeep(vm, "fallback_api");
+    let keySeed = findStringFieldDeep(vm, "key_seed");
+    if (!keySeed && fallbackApi) {
+      try {
+        keySeed = new URL(fallbackApi).searchParams.get("key_seed") || "";
+      } catch {
+        /* ignore */
       }
     }
-    return { url: "", vid };
+    const list = (vm as any)?.video_list || {};
+    for (const key of ["video_1", "video_2", ...Object.keys(list)]) {
+      const mainToken = list[key]?.main_url || list[key]?.play_url;
+      if (typeof mainToken === "string" && mainToken) {
+        const decoded = decodeDoubaoMainUrl(mainToken, keySeed);
+        if (decoded) return { url: decoded, vid, fallbackApi };
+      }
+    }
+    return { url: "", vid, fallbackApi };
   } catch {
     /* ignore */
   }
-  return { url: "", vid: "" };
+  return { url: "", vid: "", fallbackApi: "" };
 }
 
 export function extractVideoFromMessages(messages: any[]): {
   url: string;
   vid: string;
+  fallbackApi?: string;
 } | null {
   for (const m of messages || []) {
     const rawContent = m?.content;
@@ -494,7 +633,10 @@ export function extractVideoFromMessages(messages: any[]): {
         const vmInfo = decodeVideoModelInfo(v.video_model);
         const url = vmInfo.url || v.download_url || "";
         const vid = String(v.vid || v.video_id || v.id || vmInfo.vid || cr?.id || "");
-        if (url) return { url, vid };
+        const fallbackApi = vmInfo.fallbackApi || findStringFieldDeep(v, "fallback_api");
+        if (url || fallbackApi) {
+          return fallbackApi ? { url, vid, fallbackApi } : { url, vid };
+        }
       }
     }
   }
@@ -757,6 +899,60 @@ async function tryUpgradeCleanVideoUrl(
   }
 }
 
+export async function resolveUnwatermarkedFromFallbackApi(fallbackApi: string): Promise<string> {
+  if (!fallbackApi) return "";
+  let fUrl: URL;
+  try {
+    fUrl = new URL(fallbackApi);
+  } catch {
+    return "";
+  }
+  const host = fUrl.hostname.toLowerCase();
+  if (
+    fUrl.protocol !== "https:" ||
+    !fUrl.pathname.startsWith("/video/fplay/") ||
+    !TRUSTED_FALLBACK_HOST_SUFFIXES.some((s) => host.endsWith(s))
+  ) {
+    return "";
+  }
+  try {
+    // shortcut: codec_type=8 fetches ByteDance VOD master H.264 stream (~25 Mbps) instead of 2.6 Mbps watermarked transcode; switch to 0 if disk-constrained
+    fUrl.searchParams.set("channel", "no");
+    fUrl.searchParams.set("codec_type", "8");
+    fUrl.searchParams.set("logo_type", "unwatermarked");
+    const keySeedFromUrl = fUrl.searchParams.get("key_seed") || "";
+
+    const res = await axios.get(fUrl.toString(), {
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+      timeout: 20_000,
+    });
+    const payload = res.data;
+    const vInfo =
+      payload?.video_info?.data || payload?.data?.video_info?.data || payload?.data || payload;
+    const listObj = vInfo?.video_list;
+    if (!listObj || typeof listObj !== "object") return "";
+
+    const entries = (Object.values(listObj) as any[]).filter((e) => e && typeof e === "object");
+    entries.sort((a, b) => {
+      const areaDiff =
+        Number(b.vwidth || 0) * Number(b.vheight || 0) -
+        Number(a.vwidth || 0) * Number(a.vheight || 0);
+      return areaDiff !== 0 ? areaDiff : Number(b.bitrate || 0) - Number(a.bitrate || 0);
+    });
+
+    const keySeed = keySeedFromUrl || findStringFieldDeep(payload, "key_seed");
+    for (const entry of entries) {
+      const token = String(entry.main_url || entry.play_url || "");
+      const clean = decodeDoubaoMainUrl(token, keySeed);
+      if (clean) return clean;
+    }
+    return "";
+  } catch (err: any) {
+    logger.warn(`豆包 fallback_api 无水印解析失败，回退备用通道: ${err?.message || err}`);
+    return "";
+  }
+}
+
 async function pollConversationVideo(
   convId: string,
   cookieHeader: string,
@@ -795,9 +991,17 @@ async function pollConversationVideo(
       msgs.sort((a, b) => Number(a?.index || 0) - Number(b?.index || 0));
 
       const found = extractVideoFromMessages(msgs);
-      if (found?.url) {
+      if (found?.url || found?.fallbackApi) {
+        const cleanFromFallback = found.fallbackApi
+          ? await resolveUnwatermarkedFromFallbackApi(found.fallbackApi)
+          : "";
+        if (cleanFromFallback) {
+          logger.info(`✨ [豆包视频] 已通过 fallback_api 解密获取原生无水印母片流 conv=${convId}`);
+          return cleanFromFallback;
+        }
         const cleanUrl = await tryUpgradeCleanVideoUrl(found.vid, convId, cookieHeader);
-        return cleanUrl || found.url;
+        const finalUrl = cleanUrl || found.url;
+        if (finalUrl) return finalUrl;
       }
     } catch (err) {
       if (err instanceof APIException) throw err;
@@ -1021,7 +1225,12 @@ async function generateRemoteDoubaoVideo(
   if (parsed.errorMessage) {
     throw new APIException(EX.API_VIDEO_GENERATION_FAILED, `豆包视频提交失败: ${parsed.errorMessage}`);
   }
-  if (parsed.syncVideoUrl) return parsed.syncVideoUrl;
+  if (parsed.syncVideoUrl || parsed.syncFallbackApi) {
+    const cleanSync = parsed.syncFallbackApi
+      ? await resolveUnwatermarkedFromFallbackApi(parsed.syncFallbackApi)
+      : "";
+    if (cleanSync || parsed.syncVideoUrl) return cleanSync || parsed.syncVideoUrl;
+  }
 
   if (parsed.asyncTaskId) {
     const asyncParams = samanthaParams(msToken);
@@ -1045,7 +1254,12 @@ async function generateRemoteDoubaoVideo(
       }
     );
     const asyncParsed = parseSamanthaSse(String(asyncRes.data || ""));
-    if (asyncParsed.syncVideoUrl) return asyncParsed.syncVideoUrl;
+    if (asyncParsed.syncVideoUrl || asyncParsed.syncFallbackApi) {
+      const cleanAsync = asyncParsed.syncFallbackApi
+        ? await resolveUnwatermarkedFromFallbackApi(asyncParsed.syncFallbackApi)
+        : "";
+      if (cleanAsync || asyncParsed.syncVideoUrl) return cleanAsync || asyncParsed.syncVideoUrl;
+    }
   }
 
   const convId = parsed.convId || (await discoverNewConversationId(beforeIds, cookieHeader, msToken));
