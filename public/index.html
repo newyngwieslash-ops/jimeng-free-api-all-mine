@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b1020" />
-    <title>即梦 API 管理控制台</title>
+    <title>豆包 & 即梦 Seedance 视频管理控制台</title>
     <style>
       :root {
         --bg: #080c18;
@@ -167,7 +167,27 @@
       .toast { position: fixed; z-index: 40; right: 24px; bottom: 24px; max-width: 340px; padding: 12px 16px; border: 1px solid var(--line-strong); border-radius: 11px; color: white; background: #182743; box-shadow: var(--shadow); opacity: 0; transform: translateY(10px); pointer-events: none; transition: .22s; font-size: 13px; }
       .toast.show { opacity: 1; transform: translateY(0); }
 
-      @media (max-width: 960px) { .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-layout { grid-template-columns: 1fr; } }
+      /* 视频创作 */
+      .studio-layout { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+      .studio-form-card { padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(145deg, rgba(20, 31, 55, .9), rgba(13, 21, 38, .9)); }
+      .studio-form-card h3 { font-size: 15px; }
+      .studio-form-card > p { margin: 7px 0 18px; color: var(--text-soft); font-size: 12px; line-height: 1.6; }
+      .studio-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .studio-upload { display: flex; flex-direction: column; gap: 8px; }
+      .studio-upload input[type="file"] { padding: 9px 11px; font-size: 12px; }
+      .studio-preview { position: relative; display: none; }
+      .studio-preview.show { display: block; }
+      .studio-preview img { width: 100%; max-height: 150px; object-fit: cover; border: 1px solid var(--line); border-radius: 10px; }
+      .studio-preview .studio-preview-clear { position: absolute; top: 6px; right: 6px; padding: 3px 9px; border: 0; border-radius: 7px; color: white; background: rgba(10, 15, 30, .72); font-size: 11px; cursor: pointer; }
+      .studio-waiting { display: none; margin-top: 14px; padding: 11px 13px; border: 1px solid rgba(246, 200, 95, .22); border-radius: 10px; color: #f3ddab; background: rgba(246, 200, 95, .07); font-size: 12px; line-height: 1.6; }
+      .studio-waiting.show { display: block; }
+      .studio-result-empty { padding: 46px 20px; color: var(--text-faint); text-align: center; font-size: 13px; }
+      .studio-result-video { width: 100%; border-radius: 12px; background: #000; }
+      .studio-result-meta { margin-top: 12px; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+      .studio-result-actions { display: flex; gap: 9px; margin-top: 12px; }
+      .studio-result-error { margin-bottom: 4px; padding: 12px 14px; border: 1px solid rgba(255, 113, 133, .25); border-radius: 10px; color: #ffb9c4; background: rgba(255, 113, 133, .07); font-size: 12px; line-height: 1.7; }
+
+      @media (max-width: 960px) { .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-layout { grid-template-columns: 1fr; } .studio-layout { grid-template-columns: 1fr; } }
       @media (max-width: 640px) { .container { width: min(100% - 28px, 1440px); } .dashboard { padding-top: 18px; } .topbar { align-items: flex-start; flex-direction: column; } .header-actions { width: 100%; } .header-actions .btn { flex: 1; } .tabs-wrap { margin-bottom: 20px; } .stats-grid { gap: 10px; } .stat-card { min-height: 104px; padding: 15px; } .stat-value { font-size: 25px; } .panel-head, .panel-body { padding-left: 15px; padding-right: 15px; } .notice { margin-left: 15px; margin-right: 15px; } .section-heading { align-items: flex-start; flex-direction: column; } .auth-box { padding: 30px 24px; } }
     </style>
   </head>
@@ -175,8 +195,8 @@
     <div id="auth-page" class="auth-container">
       <div class="auth-box">
         <h1 class="brand-mark">
-          <span class="brand-icon">即</span>
-          <span><span class="brand-title">即梦 API</span><span class="brand-subtitle">本地服务管理控制台</span></span>
+          <span class="brand-icon">影</span>
+          <span><span class="brand-title">Seedance API</span><span class="brand-subtitle">豆包多账号 · 即梦本地管理控制台</span></span>
         </h1>
         <div id="setup-form" class="hidden">
           <div class="form-group"><label for="setup-username">管理员账号</label><input id="setup-username" type="text" placeholder="设置管理员账号" /></div>
@@ -196,16 +216,17 @@
     <main id="dashboard" class="dashboard container">
       <header class="topbar">
         <div>
-          <div class="eyebrow">即梦 API · 本地服务</div>
+          <div class="eyebrow">豆包 & 即梦 · Seedance 服务</div>
           <h1 class="page-title">管理控制台</h1>
-          <p class="page-desc">集中管理 API 密钥、即梦账号池与服务运行状态</p>
+          <p class="page-desc">集中管理多账号豆包 / 即梦 Cookie 池、Seedance 视频创作与 OpenAI 兼容 API 密钥</p>
         </div>
         <div class="header-actions"><button class="btn btn-secondary" onclick="showPasswordModal()">修改密码</button><button class="btn btn-secondary" onclick="handleLogout()">退出登录</button></div>
       </header>
 
       <nav class="tabs-wrap" aria-label="控制台导航">
         <button class="tab-btn active" data-tab="keys"><span class="tab-icon">钥</span>API 密钥</button>
-        <button class="tab-btn" data-tab="accounts"><span class="tab-icon">号</span>即梦账号池</button>
+        <button class="tab-btn" data-tab="studio"><span class="tab-icon">创</span>视频创作</button>
+        <button class="tab-btn" data-tab="accounts"><span class="tab-icon">号</span>账号池</button>
         <button class="tab-btn" data-tab="stats"><span class="tab-icon">览</span>运行概览</button>
         <button class="tab-btn" data-tab="logs"><span class="tab-icon">志</span>实时日志</button>
         <button class="tab-btn" data-tab="media"><span class="tab-icon">媒</span>媒体资源</button>
@@ -226,17 +247,73 @@
         </div>
       </section>
 
+      <section id="tab-studio" class="tab-content">
+        <div class="section-heading"><div><h2>视频创作</h2><p>使用多豆包账号或即梦账号生成 Seedance 无水印视频；单号限额/过期时自动切下一可用账号重试。</p></div></div>
+        <div class="studio-layout">
+          <div class="studio-form-card">
+            <h3>创作表单</h3>
+            <p id="studio-hint">豆包多账号自动轮询与额度耗尽切换：不传参考图为文生视频（精确模型选择），上传图片为图生视频。</p>
+            <div class="form-group">
+              <label for="studio-model">视频模型与通道</label>
+              <select id="studio-model" onchange="onStudioModelChange()">
+                <optgroup label="豆包网页版（推荐 · 免浏览器直连 · 自动去水印）">
+                  <option value="doubao-seedance-2.0-mini" selected>豆包 · Seedance 2.0 Mini（免费日常 · 推荐）</option>
+                  <option value="doubao-seedance-2.0-fast">豆包 · Seedance 2.0 Fast（免费快速）</option>
+                  <option value="doubao-seedance-2.0">豆包 · Seedance 2.0 标准版（需豆包订阅 · 2x）</option>
+                  <option value="doubao-seedance-2.5">豆包 · Seedance 2.5 旗舰版（需豆包订阅 · 5x）</option>
+                </optgroup>
+                <optgroup label="即梦通道">
+                  <option value="jimeng-video-seedance-2.5">即梦 · Seedance 2.5</option>
+                  <option value="jimeng-video-seedance-2.0-mini">即梦 · Seedance 2.0 Mini</option>
+                  <option value="jimeng-video-seedance-2.0-fast">即梦 · Seedance 2.0 Fast</option>
+                </optgroup>
+              </select>
+            </div>
+            <div class="form-group"><label for="studio-prompt">视频提示词</label><textarea id="studio-prompt" rows="4" placeholder="输入完整的镜头描述，例如：镜头缓缓推进，海浪拍打礁石，逆光，电影感"></textarea></div>
+            <div class="studio-row">
+              <div class="form-group studio-upload"><label id="studio-first-label" for="studio-first-frame">参考图 / 首帧（可选，不传为文生视频）</label><input type="file" id="studio-first-frame" accept="image/*" onchange="studioPreviewFile('first')" /><div id="studio-first-preview" class="studio-preview"><img alt="首帧预览" /><button class="studio-preview-clear" onclick="studioClearFile('first')">移除</button></div></div>
+              <div id="studio-last-group" class="form-group studio-upload hidden"><label for="studio-last-frame">尾帧参考图（可选）</label><input type="file" id="studio-last-frame" accept="image/*" onchange="studioPreviewFile('last')" /><div id="studio-last-preview" class="studio-preview"><img alt="尾帧预览" /><button class="studio-preview-clear" onclick="studioClearFile('last')">移除</button></div></div>
+            </div>
+            <div class="studio-row">
+              <div class="form-group"><label for="studio-duration">视频时长</label><select id="studio-duration"></select></div>
+              <div class="form-group"><label for="studio-ratio">视频比例</label><select id="studio-ratio"></select></div>
+            </div>
+            <button id="studio-submit" class="btn btn-primary btn-full" onclick="submitStudioVideo()">开始生成</button>
+            <div id="studio-waiting" class="studio-waiting">正在生成视频，豆包渲染通常需 1–6 分钟，期间请勿关闭页面…</div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><div><h3>生成结果</h3><p>结果同时会保存到「媒体资源」页签</p></div></div>
+            <div class="panel-body" id="studio-result">
+              <div class="studio-result-empty">提交后生成结果将显示在这里</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section id="tab-accounts" class="tab-content">
-        <div class="section-heading"><div><h2>即梦账号池</h2><p>保存多个账号 Cookie，服务会自动轮询可用账号。</p></div><button class="btn btn-secondary" onclick="loadAccounts()">刷新状态</button></div>
+        <div class="section-heading"><div><h2>多账号池（豆包 & 即梦）</h2><p>加密保存多个豆包或即梦账号 Cookie，生成时自动轮询并在单号限额/失效时无缝切号重试。</p></div><button class="btn btn-secondary" onclick="loadAccounts()">刷新列表</button></div>
         <div class="stats-grid">
           <div class="stat-card"><div class="stat-label">账号总数</div><div id="account-total" class="stat-value accent">0</div><div class="stat-note">已纳入账号池</div></div>
           <div class="stat-card"><div class="stat-label">运行中</div><div id="account-active" class="stat-value green">0</div><div class="stat-note">允许被调度</div></div>
           <div class="stat-card"><div class="stat-label">已停用</div><div id="account-disabled" class="stat-value">0</div><div class="stat-note">不会参与轮询</div></div>
-          <div class="stat-card"><div class="stat-label">Cookie 安全</div><div class="stat-value" style="font-size:22px">已加密</div><div class="stat-note">服务端仅保存加密凭证</div></div>
+          <div class="stat-card"><div class="stat-label">Cookie 安全</div><div class="stat-value" style="font-size:22px">已加密</div><div class="stat-note">AES-256-GCM 密文存储</div></div>
         </div>
         <div class="account-layout">
-          <div class="form-card"><h3>添加即梦账号</h3><p>建议为账号设置容易识别的名称。Cookie 不会回显到页面。</p><div class="form-group"><label for="account-name">账号名称</label><input id="account-name" type="text" placeholder="例如：主账号、备用账号 1" /></div><div class="form-group"><label for="account-cookie">Cookie</label><textarea id="account-cookie" rows="5" placeholder="粘贴包含 sessionid 的 Cookie"></textarea></div><button class="btn btn-primary" onclick="createAccount()">保存到账号池</button></div>
-          <div class="panel account-table-panel"><div class="panel-head"><div><h3>账号列表</h3><p>可单独启用、停用或刷新会员状态</p></div></div><div class="notice">Cookie 属于敏感凭证，请勿分享给他人。账号状态查询失败时，可点击“刷新状态”重试。</div><div class="table-scroll"><table><thead><tr><th>名称</th><th>凭证</th><th>状态</th><th>免费积分</th><th>会员状态</th><th>操作</th></tr></thead><tbody id="accounts-table"></tbody></table></div></div>
+          <div class="form-card">
+            <h3>添加账号</h3>
+            <p>支持添加多个豆包（doubao.com）或即梦账号。Cookie 加密存储，不会回显到页面。</p>
+            <div class="form-group">
+              <label for="account-provider">所属平台</label>
+              <select id="account-provider" onchange="onAccountProviderChange()">
+                <option value="doubao" selected>豆包网页版 (www.doubao.com)</option>
+                <option value="jimeng">即梦 (jimeng.jianying.com)</option>
+              </select>
+            </div>
+            <div class="form-group"><label for="account-name">账号名称</label><input id="account-name" type="text" placeholder="例如：豆包号 1、豆包号 2" /></div>
+            <div class="form-group"><label for="account-cookie">Cookie / SessionID</label><textarea id="account-cookie" rows="5" placeholder="粘贴 www.doubao.com 包含 sessionid 的完整 Cookie（建议含 ttwid、passport_csrf_token），或直接填 sessionid"></textarea></div>
+            <button class="btn btn-primary" onclick="createAccount()">保存到账号池</button>
+          </div>
+          <div class="panel account-table-panel"><div class="panel-head"><div><h3>账号列表</h3><p>按平台隔离调度；单号触发限额自动冷却并切换下一账号</p></div></div><div class="notice">获取豆包 Cookie：浏览器登录 <code>https://www.doubao.com/chat/</code> → F12 网络面板任选请求 → 复制请求头中的完整 <code>Cookie</code> 值粘贴到左侧即可。</div><div class="table-scroll"><table><thead><tr><th>平台</th><th>名称</th><th>凭证</th><th>状态</th><th>可用额度/积分</th><th>套餐/详情</th><th>操作</th></tr></thead><tbody id="accounts-table"></tbody></table></div></div>
         </div>
       </section>
 
@@ -277,7 +354,107 @@
       async function handleLogout() { await fetch("/dashboard/logout", { method: "POST", credentials: "include" }); location.reload(); }
       function showDashboard() { $("auth-page").style.display = "none"; $("dashboard").classList.add("active"); activateTab("keys"); startAutoRefresh(); }
       function startAutoRefresh() { clearInterval(autoRefreshInterval); autoRefreshInterval = setInterval(() => { const active = document.querySelector(".tab-btn.active")?.dataset.tab; if (active === "stats") loadStats(); if (active === "keys") loadManagedKeys(); if (active === "accounts") loadAccounts(); }, 15000); }
-      function activateTab(name) { document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name)); document.querySelectorAll(".tab-content").forEach((c) => c.classList.toggle("active", c.id === "tab-" + name)); if (name === "keys") loadManagedKeys(); else if (name === "accounts") loadAccounts(); else if (name === "stats") loadStats(); else if (name === "logs") loadLogs(); else if (name === "media") loadMedia(); else if (name === "settings") loadSettings(); }
+      function activateTab(name) { document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name)); document.querySelectorAll(".tab-content").forEach((c) => c.classList.toggle("active", c.id === "tab-" + name)); if (name === "keys") loadManagedKeys(); else if (name === "accounts") loadAccounts(); else if (name === "stats") loadStats(); else if (name === "logs") loadLogs(); else if (name === "media") loadMedia(); else if (name === "settings") loadSettings(); else if (name === "studio") initStudioTab(); }
+
+      /* ===== 视频创作 ===== */
+      let studioInitialized = false, studioBusy = false;
+      function isDoubaoSelected() { return ($("studio-model")?.value || "").startsWith("doubao-"); }
+      function onStudioModelChange() {
+        const doubao = isDoubaoSelected();
+        const durationSelect = $("studio-duration");
+        durationSelect.innerHTML = "";
+        const durations = doubao ? [5, 10] : [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        const defaultDur = doubao ? 10 : 5;
+        durations.forEach((s) => {
+          const opt = document.createElement("option");
+          opt.value = s; opt.textContent = s + " 秒";
+          if (s === defaultDur) opt.selected = true;
+          durationSelect.appendChild(opt);
+        });
+        const ratioSelect = $("studio-ratio");
+        const prevRatio = ratioSelect.value || "16:9";
+        const ratios = [
+          ["16:9", "16:9 横屏"], ["9:16", "9:16 竖屏"], ["1:1", "1:1 方形"], ["4:3", "4:3"], ["3:4", "3:4"],
+          ...(doubao ? [["21:9", "21:9 超宽屏"]] : [])
+        ];
+        ratioSelect.innerHTML = ratios.map(([v, label]) => `<option value="${v}" ${v === prevRatio ? "selected" : ""}>${label}</option>`).join("");
+        $("studio-first-label").textContent = doubao ? "参考图 / 首帧（可选，不传为文生视频）" : "首帧参考图（可选，即梦 2.5 建议上传）";
+        $("studio-last-group").classList.toggle("hidden", doubao);
+        $("studio-hint").textContent = doubao
+          ? "豆包多账号自动轮询与额度耗尽切换：不传参考图为文生视频（精确模型选择），上传图片为图生视频。"
+          : "即梦多账号自动轮询切换：支持首尾帧过渡运镜（即梦 2.5 建议上传首帧以避免上游风控）。";
+      }
+      function initStudioTab() {
+        if (studioInitialized) return;
+        onStudioModelChange();
+        studioInitialized = true;
+      }
+      function studioPreviewFile(kind) {
+        const input = $(kind === "first" ? "studio-first-frame" : "studio-last-frame");
+        const preview = $(kind === "first" ? "studio-first-preview" : "studio-last-preview");
+        const file = input.files && input.files[0];
+        if (!file) { preview.classList.remove("show"); return; }
+        preview.querySelector("img").src = URL.createObjectURL(file);
+        preview.classList.add("show");
+      }
+      function studioClearFile(kind) {
+        const input = $(kind === "first" ? "studio-first-frame" : "studio-last-frame");
+        const preview = $(kind === "first" ? "studio-first-preview" : "studio-last-preview");
+        input.value = ""; preview.classList.remove("show");
+      }
+      function studioSetBusy(busy) {
+        studioBusy = busy;
+        const btn = $("studio-submit");
+        btn.disabled = busy;
+        btn.textContent = busy ? "生成中…（约 1–6 分钟）" : "开始生成";
+        $("studio-waiting").classList.toggle("show", busy);
+      }
+      async function submitStudioVideo() {
+        if (studioBusy) return;
+        const prompt = $("studio-prompt").value.trim();
+        const model = $("studio-model").value;
+        const firstInput = $("studio-first-frame");
+        const lastInput = $("studio-last-frame");
+        if (!prompt) return showToast("请填写视频提示词");
+        if (!isDoubaoSelected() && lastInput.files?.[0] && !firstInput.files?.[0]) {
+          return showToast("上传尾帧时请先上传首帧参考图");
+        }
+        const form = new FormData();
+        form.append("model", model);
+        form.append("prompt", prompt);
+        form.append("duration", $("studio-duration").value);
+        form.append("ratio", $("studio-ratio").value);
+        if (firstInput.files && firstInput.files[0]) form.append("first_frame", firstInput.files[0]);
+        if (!isDoubaoSelected() && lastInput.files && lastInput.files[0]) form.append("last_frame", lastInput.files[0]);
+        studioSetBusy(true);
+        $("studio-result").innerHTML = '<div class="studio-result-empty">正在调度可用账号生成视频，请耐心等待…</div>';
+        const startedAt = Date.now();
+        try {
+          const res = await fetch("/dashboard/video-generate", { method: "POST", credentials: "include", body: form });
+          let data = {};
+          try { data = await res.json(); } catch (e) { /* 非 JSON 响应 */ }
+          if (!res.ok) {
+            const msg = esc(data.error || `生成失败（HTTP ${res.status}）`);
+            $("studio-result").innerHTML = `<div class="studio-result-error">${msg}</div>`;
+            showToast(data.error || "生成失败");
+            return;
+          }
+          const elapsed = Math.round((Date.now() - startedAt) / 1000);
+          const accountMeta = data.account_name ? `　·　使用账号：${esc(data.account_name)}` : "";
+          const meta = `模型：${esc(data.model || model)}${accountMeta}　·　时长：${esc(data.duration)} 秒　·　比例：${esc(data.ratio)}　·　耗时约 ${esc(data.elapsed_seconds || elapsed)} 秒`;
+          $("studio-result").innerHTML = `
+            <video class="studio-result-video" src="${esc(data.video_url)}" controls preload="metadata"></video>
+            <div class="studio-result-actions"><a class="btn btn-secondary" href="${esc(data.video_url)}" target="_blank" rel="noopener">下载 / 新窗口打开</a></div>
+            <div class="studio-result-meta">${meta}<br/>提示词：${esc(prompt)}</div>`;
+          showToast("视频生成成功");
+        } catch (e) {
+          console.error(e);
+          $("studio-result").innerHTML = `<div class="studio-result-error">请求失败：${esc(e.message)}。请检查服务状态或网络后重试。</div>`;
+          showToast("请求失败，请检查服务状态");
+        } finally {
+          studioSetBusy(false);
+        }
+      }
       document.querySelectorAll(".tab-btn").forEach((btn) => btn.addEventListener("click", () => activateTab(btn.dataset.tab)));
 
       async function loadManagedKeys() { try { const res = await fetch("/dashboard/keys", { credentials: "include" }); if (!res.ok) return; const keys = await res.json(); const active = keys.filter((k) => k.enabled).length; $("key-total").textContent = keys.length; $("key-active").textContent = active; $("key-disabled").textContent = keys.length - active; $("managed-keys-table").innerHTML = keys.map((k) => `<tr><td><strong>${esc(k.name || "未命名密钥")}</strong></td><td><code>${esc(k.key_preview)}</code></td><td>${badge(k.enabled)}</td><td>${dateText(k.created_at)}</td><td>${dateText(k.last_used)}</td><td><div class="row-actions"><button class="btn btn-secondary" onclick="setManagedKeyStatus(${k.id}, ${!k.enabled})">${k.enabled ? "停用" : "启用"}</button><button class="btn btn-danger" onclick="deleteManagedKey(${k.id})">撤销</button></div></td></tr>`).join("") || emptyRow(6, "还没有 API 密钥，点击右上角创建第一个"); } catch (e) { console.error(e); } }
@@ -288,11 +465,20 @@
       async function setManagedKeyStatus(id, enabled) { const res = await fetch(`/dashboard/keys/${id}/status`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); if (res.ok) { loadManagedKeys(); showToast(enabled ? "密钥已启用" : "密钥已停用"); } }
       async function deleteManagedKey(id) { if (!confirm("确定撤销这个 API 密钥吗？撤销后无法恢复。")) return; const res = await fetch(`/dashboard/keys/${id}`, { method: "DELETE", credentials: "include" }); if (res.ok) { loadManagedKeys(); showToast("密钥已撤销"); } }
 
-      function membershipText(value) { if (!value) return "未知"; if (typeof value === "string") return value; return value.name || value.plan || value.level || (value.isVip ? "会员" : "普通账号"); }
+      function membershipText(value, errorText) { if (errorText) return "⚠️ " + errorText; if (!value || value === "unknown") return "未查询"; if (typeof value === "string") return value; return value.name || value.plan || value.level || (value.isVip ? "会员" : "普通账号"); }
+      function providerBadge(provider) { return provider === "doubao" ? `<span class="badge" style="color:var(--cyan);background:rgba(55,213,232,.12)">豆包</span>` : `<span class="badge" style="color:#c9b8ff;background:rgba(139,92,246,.14)">即梦</span>`; }
+      function accountStateBadge(a) { if (!a.enabled) return badge(false); if (a.cooldownUntil && new Date(a.cooldownUntil).getTime() > Date.now()) return `<span class="badge badge-warn">冷却中</span>`; return badge(true); }
+      function onAccountProviderChange() {
+        const doubao = $("account-provider").value === "doubao";
+        $("account-name").placeholder = doubao ? "例如：豆包号 1、豆包号 2" : "例如：即梦主账号、备用账号 1";
+        $("account-cookie").placeholder = doubao
+          ? "粘贴 www.doubao.com 包含 sessionid 的完整 Cookie（建议含 ttwid、passport_csrf_token），或直接填 sessionid"
+          : "粘贴 jimeng.jianying.com 包含 sessionid 的 Cookie";
+      }
       function apiError(payload, fallback) { return payload?.message || payload?.error || payload?.data?.message || fallback; }
       function isApiFailure(payload) { return payload && typeof payload.code === "number" && payload.code !== 0; }
-      async function loadAccounts() { try { const res = await fetch("/account-pool/", { credentials: "include" }); const payload = await res.json(); if (!res.ok || isApiFailure(payload) || !Array.isArray(payload)) { showToast(apiError(payload, "账号列表读取失败")); return; } const accounts = payload; const active = accounts.filter((a) => a.enabled).length; $("account-total").textContent = accounts.length; $("account-active").textContent = active; $("account-disabled").textContent = accounts.length - active; $("accounts-table").innerHTML = accounts.map((a) => `<tr><td><strong>${esc(a.name || "未命名账号")}</strong></td><td><code>${esc(a.credentialPreview || "********")}</code></td><td>${badge(a.enabled)}</td><td>${esc(a.status?.totalCredit ?? "—")}</td><td>${esc(membershipText(a.status?.membership))}</td><td><div class="row-actions"><button class="btn btn-secondary" onclick="setAccountStatus('${esc(a.id)}', ${!a.enabled})">${a.enabled ? "停用" : "启用"}</button><button class="btn btn-secondary" onclick="refreshAccount('${esc(a.id)}')">刷新状态</button><button class="btn btn-danger" onclick="deleteAccount('${esc(a.id)}')">删除</button></div></td></tr>`).join("") || emptyRow(6, "还没有账号，请从左侧添加"); } catch (e) { console.error(e); showToast("账号列表读取失败"); } }
-      async function createAccount() { const name = $("account-name").value.trim(), cookie = $("account-cookie").value.trim(); if (!name || !cookie) return showToast("请填写账号名称和 Cookie"); try { const res = await fetch("/account-pool/", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, cookie }) }); const data = await res.json(); if (!res.ok || isApiFailure(data)) return showToast(apiError(data, "添加账号失败")); $("account-name").value = ""; $("account-cookie").value = ""; await loadAccounts(); showToast("账号已加入账号池"); } catch (e) { console.error(e); showToast("添加账号失败，请检查服务日志"); } }
+      async function loadAccounts() { try { const res = await fetch("/account-pool/", { credentials: "include" }); const payload = await res.json(); if (!res.ok || isApiFailure(payload) || !Array.isArray(payload)) { showToast(apiError(payload, "账号列表读取失败")); return; } const accounts = payload; const active = accounts.filter((a) => a.enabled).length; $("account-total").textContent = accounts.length; $("account-active").textContent = active; $("account-disabled").textContent = accounts.length - active; $("accounts-table").innerHTML = accounts.map((a) => `<tr><td>${providerBadge(a.provider)}</td><td><strong>${esc(a.name || "未命名账号")}</strong></td><td><code>${esc(a.credentialPreview || "********")}</code></td><td>${accountStateBadge(a)}</td><td>${esc(a.status?.totalCredit ?? a.status?.freeCredit ?? "—")}</td><td title="${esc(a.status?.error || "")}">${esc(membershipText(a.status?.membership, a.status?.error))}</td><td><div class="row-actions"><button class="btn btn-secondary" onclick="setAccountStatus('${esc(a.id)}', ${!a.enabled})">${a.enabled ? "停用" : "启用"}</button><button class="btn btn-secondary" onclick="refreshAccount('${esc(a.id)}')">刷新状态</button><button class="btn btn-danger" onclick="deleteAccount('${esc(a.id)}')">删除</button></div></td></tr>`).join("") || emptyRow(7, "还没有账号，请从左侧添加豆包或即梦账号"); } catch (e) { console.error(e); showToast("账号列表读取失败"); } }
+      async function createAccount() { const provider = $("account-provider").value, name = $("account-name").value.trim(), cookie = $("account-cookie").value.trim(); if (!name || !cookie) return showToast("请填写账号名称和 Cookie"); try { const res = await fetch("/account-pool/", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, provider, cookie }) }); const data = await res.json(); if (!res.ok || isApiFailure(data)) return showToast(apiError(data, "添加账号失败")); $("account-name").value = ""; $("account-cookie").value = ""; await loadAccounts(); showToast("账号已加入账号池"); } catch (e) { console.error(e); showToast("添加账号失败，请检查服务日志"); } }
       async function setAccountStatus(id, enabled) { const res = await fetch(`/account-pool/${id}/enabled`, { method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }); if (res.ok) { loadAccounts(); showToast(enabled ? "账号已启用" : "账号已停用"); } }
       async function refreshAccount(id) { const res = await fetch(`/account-pool/${id}/refresh-status`, { method: "POST", credentials: "include" }); const data = await res.json(); if (!res.ok || isApiFailure(data)) showToast(apiError(data, "状态查询失败")); else showToast("账号状态已更新"); loadAccounts(); }
       async function deleteAccount(id) { if (!confirm("确定从账号池删除这个账号吗？")) return; const res = await fetch(`/account-pool/${id}`, { method: "DELETE", credentials: "include" }); if (res.ok) { loadAccounts(); showToast("账号已删除"); } }

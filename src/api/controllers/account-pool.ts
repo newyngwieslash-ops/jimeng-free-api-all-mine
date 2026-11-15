@@ -1,7 +1,7 @@
 import Request from "@/lib/request/Request.ts";
 import Response from "@/lib/response/Response.ts";
 import db from "@/lib/database.ts";
-import accountPool, { type AccountSelectionStrategy } from "@/lib/account-pool.ts";
+import accountPool, { type AccountProvider, type AccountSelectionStrategy } from "@/lib/account-pool.ts";
 
 function requireAdmin(request: Request): Response | null {
   const sessionId = request.headers.cookie?.match(/(?:^|;\s*)session=([^;]+)/)?.[1];
@@ -18,11 +18,21 @@ function accountIdOrResponse(request: Request): string | Response {
   return id(request);
 }
 
-export async function list(request: Request) { const denied = requireAdmin(request); return denied || accountPool.list(); }
+export async function list(request: Request) {
+  const denied = requireAdmin(request);
+  const provider = request.query?.provider === "doubao" || request.query?.provider === "jimeng"
+    ? (request.query.provider as AccountProvider)
+    : undefined;
+  return denied || accountPool.list(provider);
+}
 export async function get(request: Request) { const denied = requireAdmin(request); const accountId = accountIdOrResponse(request); return denied || (accountId instanceof Response ? accountId : accountPool.get(accountId)); }
 export async function create(request: Request) { const denied = requireAdmin(request); return denied || accountPool.create(request.body || {}); }
 export async function update(request: Request) { const denied = requireAdmin(request); const accountId = accountIdOrResponse(request); return denied || (accountId instanceof Response ? accountId : accountPool.update(accountId, request.body || {})); }
 export async function remove(request: Request) { const denied = requireAdmin(request); const accountId = accountIdOrResponse(request); if (denied) return denied; if (accountId instanceof Response) return accountId; accountPool.delete(accountId); return { success: true }; }
 export async function enable(request: Request) { const denied = requireAdmin(request); const accountId = accountIdOrResponse(request); return denied || (accountId instanceof Response ? accountId : accountPool.setEnabled(accountId, Boolean(request.body?.enabled))); }
 export async function refresh(request: Request) { const denied = requireAdmin(request); const accountId = accountIdOrResponse(request); return denied || (accountId instanceof Response ? accountId : accountPool.refreshStatus(accountId)); }
-export async function select(request: Request) { const denied = requireAdmin(request); return denied || accountPool.select((request.query.strategy || "least_failures") as AccountSelectionStrategy).account; }
+export async function select(request: Request) {
+  const denied = requireAdmin(request);
+  const provider = request.query?.provider === "doubao" ? "doubao" : "jimeng";
+  return denied || accountPool.select((request.query.strategy || "least_failures") as AccountSelectionStrategy, { provider }).account;
+}

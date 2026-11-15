@@ -1,9 +1,9 @@
 import _ from 'lodash';
 
 import Request from '@/lib/request/Request.ts';
-import Response from '@/lib/response/Response.ts';
 import { generateVideoWithRetry, DEFAULT_MODEL } from '@/api/controllers/videos.ts';
-import { markCredentialFailure, markCredentialSuccess, resolveAuthorization } from '@/api/controllers/auth.ts';
+import { generateDoubaoVideo, isDoubaoVideoModel } from '@/api/controllers/doubao-videos.ts';
+import { executeWithCredentialFailover } from '@/api/controllers/auth.ts';
 import util from '@/lib/util.ts';
 import db from '@/lib/database.ts';
 
@@ -34,12 +34,6 @@ export default {
                 .validate('body.response_format', v => _.isUndefined(v) || _.isString(v))
                 .validate('headers.authorization', _.isString);
 
-            // refresh_token切分
-            // 随机挑选一个refresh_token
-            const credential = await resolveAuthorization(request.headers.authorization);
-            const token = credential.token;
-            const statsKey = credential.managedKey || token;
-
             const {
                 model = DEFAULT_MODEL,
                 prompt,
@@ -51,33 +45,24 @@ export default {
             } = request.body;
 
             // 处理文件上传
-            let filePaths = [...file_paths];
+            const filePaths = [...file_paths];
             const files: Record<string, any> = request.files || {};
             if (!_.isEmpty(files)) {
                 Object.values(files).forEach(file => appendUploadedPaths(file, filePaths));
             }
 
-            // 生成视频
-            let videoUrl;
-            try {
-                videoUrl = await generateVideoWithRetry(
-                    model,
-                    prompt,
-                    {
-                        ratio,
-                        resolution,
-                        duration,
-                        filePaths
-                    },
-                    token
-                );
-                markCredentialSuccess(credential);
-            } catch (error) {
-                markCredentialFailure(credential);
-                throw error;
-            }
+            const useDoubao = isDoubaoVideoModel(model);
+            const provider = useDoubao ? 'doubao' : 'jimeng';
 
-            // 记录统计和媒体
+            const { result: videoUrl, credential } = await executeWithCredentialFailover(
+                request.headers.authorization,
+                provider,
+                (cred) => useDoubao
+                    ? generateDoubaoVideo(model, prompt, { ratio, resolution, duration, filePaths }, cred.token)
+                    : generateVideoWithRetry(model, prompt, { ratio, resolution, duration, filePaths }, cred.token)
+            );
+
+            const statsKey = credential.managedKey || credential.accountName || credential.token;
             try {
                 db.recordCall(statsKey, model, 0);
                 if (videoUrl) db.saveMedia('video', videoUrl, model, prompt, statsKey);
@@ -85,7 +70,6 @@ export default {
                 // 忽略数据库错误
             }
 
-            // 根据response_format返回不同格式的结果
             if (response_format === "b64_json") {
                 const videoBase64 = await util.fetchFileBASE64(videoUrl);
                 return {
@@ -95,15 +79,14 @@ export default {
                         revised_prompt: prompt
                     }]
                 };
-            } else {
-                return {
-                    created: util.unixTimestamp(),
-                    data: [{
-                        url: videoUrl,
-                        revised_prompt: prompt
-                    }]
-                };
             }
+            return {
+                created: util.unixTimestamp(),
+                data: [{
+                    url: videoUrl,
+                    revised_prompt: prompt
+                }]
+            };
         }
 
     }

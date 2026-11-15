@@ -8,6 +8,7 @@ import util from "@/lib/util.ts";
 import db from "@/lib/database.ts";
 import { generateImagesWithRetry, DEFAULT_MODEL } from "./images.ts";
 import { generateVideo, DEFAULT_MODEL as DEFAULT_VIDEO_MODEL } from "./videos.ts";
+import { generateDoubaoVideo, isDoubaoVideoModel } from "./doubao-videos.ts";
 import { getCredit } from "./core.ts";
 
 // 最大重试次数
@@ -38,7 +39,7 @@ function parseModel(model: string) {
  * @returns 是否为视频生成请求
  */
 function isVideoModel(model: string) {
-  return model.startsWith("jimeng-video");
+  return model.startsWith("jimeng-video") || isDoubaoVideoModel(model);
 }
 
 /**
@@ -158,41 +159,53 @@ export async function createCompletion(
     const promptText = extractTextFromMessage(lastMessage);
 
     // 检查是否为视频生成请求
-    if (isVideoModel(_model)) {
+    if (isVideoModel(model)) {
       try {
         // 视频生成
-        logger.info(`开始生成视频，模型: ${_model}，图片数量: ${imageUrls.length}`);
+        logger.info(`开始生成视频，模型: ${model}，图片数量: ${imageUrls.length}`);
+        const useDoubao = isDoubaoVideoModel(model);
 
-        // 查询生成前的积分
+        // 查询生成前的积分（仅即梦）
         let creditsBefore = 0;
-        try {
-          const beforeCredit = await getCredit(refreshToken);
-          creditsBefore = beforeCredit.totalCredit;
-        } catch (e) { /* 忽略积分查询错误 */ }
+        if (!useDoubao) {
+          try {
+            const beforeCredit = await getCredit(refreshToken);
+            creditsBefore = beforeCredit.totalCredit;
+          } catch (e) { /* 忽略积分查询错误 */ }
+        }
 
-        const videoUrl = await generateVideo(
-          _model,
-          promptText || lastMessage.content,
-          {
-            width,
-            height,
-            resolution: "720p", // 默认分辨率
-            filePaths: imageUrls, // 传递提取的图片作为首尾帧
-          },
-          refreshToken
-        );
+        const videoUrl = useDoubao
+          ? await generateDoubaoVideo(
+              model,
+              promptText || lastMessage.content,
+              { resolution: "720p", filePaths: imageUrls },
+              refreshToken
+            )
+          : await generateVideo(
+              model,
+              promptText || lastMessage.content,
+              {
+                width,
+                height,
+                resolution: "720p", // 默认分辨率
+                filePaths: imageUrls, // 传递提取的图片作为首尾帧
+              },
+              refreshToken
+            );
 
         logger.info(`视频生成成功，URL: ${videoUrl}`);
 
-        // 查询生成后的积分并计算消耗
+        // 查询生成后的积分并计算消耗（仅即梦）
         let creditsUsed = 0;
         let remainingCredits = 0;
-        try {
-          const afterCredit = await getCredit(refreshToken);
-          remainingCredits = afterCredit.totalCredit;
-          creditsUsed = Math.max(0, creditsBefore - remainingCredits);
-          logger.info(`积分消耗: ${creditsUsed}, 剩余: ${remainingCredits}`);
-        } catch (e) { /* 忽略积分查询错误 */ }
+        if (!useDoubao) {
+          try {
+            const afterCredit = await getCredit(refreshToken);
+            remainingCredits = afterCredit.totalCredit;
+            creditsUsed = Math.max(0, creditsBefore - remainingCredits);
+            logger.info(`积分消耗: ${creditsUsed}, 剩余: ${remainingCredits}`);
+          } catch (e) { /* 忽略积分查询错误 */ }
+        }
 
         // 记录统计和媒体
         try {
@@ -303,6 +316,7 @@ export async function createCompletion(
       };
     }
   })().catch((err) => {
+    if (err instanceof APIException) throw err;
     if (retryCount < MAX_RETRY_COUNT) {
       logger.error(`Response error: ${err.stack}`);
       logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
@@ -349,7 +363,7 @@ export async function createCompletionStream(
     }
 
     // 检查是否为视频生成请求
-    if (isVideoModel(_model)) {
+    if (isVideoModel(model)) {
       // 视频生成
       stream.write(
         "data: " +
@@ -441,11 +455,19 @@ export async function createCompletionStream(
         "\n\n"
       );
 
-      generateVideo(
-        _model,
-        promptText || lastMessage.content,
-        { width, height, resolution: "720p", filePaths: imageUrls },
-        refreshToken
+      (isDoubaoVideoModel(model)
+        ? generateDoubaoVideo(
+            model,
+            promptText || lastMessage.content,
+            { resolution: "720p", filePaths: imageUrls },
+            refreshToken
+          )
+        : generateVideo(
+            model,
+            promptText || lastMessage.content,
+            { width, height, resolution: "720p", filePaths: imageUrls },
+            refreshToken
+          )
       )
         .then((videoUrl) => {
           clearInterval(progressInterval);
@@ -651,6 +673,7 @@ export async function createCompletionStream(
     }
     return stream;
   })().catch((err) => {
+    if (err instanceof APIException) throw err;
     if (retryCount < MAX_RETRY_COUNT) {
       logger.error(`Response error: ${err.stack}`);
       logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);

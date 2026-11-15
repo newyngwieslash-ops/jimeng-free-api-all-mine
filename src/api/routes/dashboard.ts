@@ -1,8 +1,23 @@
+import _ from 'lodash';
+import fs from 'fs';
+import mime from 'mime';
+
 import Request from '@/lib/request/Request.ts';
 import Response from '@/lib/response/Response.ts';
 import db from '@/lib/database.ts';
 import { getCredit } from '@/api/controllers/core.ts';
 import browserTransport from '@/lib/browser-transport.ts';
+import { generateVideoWithRetry } from '@/api/controllers/videos.ts';
+import {
+  DEFAULT_DOUBAO_VIDEO_MODEL,
+  DOUBAO_RATIOS,
+  generateDoubaoVideo,
+  isDoubaoVideoModel,
+} from '@/api/controllers/doubao-videos.ts';
+import { executeWithPoolFailover } from '@/api/controllers/auth.ts';
+import logger from '@/lib/logger.ts';
+
+const STUDIO_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 
 function sessionUser(request: Request): number | null {
   const sessionId = request.headers.cookie?.match(/(?:^|;\s*)session=([^;]+)/)?.[1];
@@ -99,6 +114,101 @@ export default {
         return new Response({ error: '模式参数无效' }, { statusCode: 400 });
       await browserTransport.setMode(mode);
       return { success: true, browserTransport: await browserTransport.getStatus() };
+    },
+    '/video-generate': async (request: Request) => {
+      const error = authError(request); if (error) return error;
+
+      // ---- 参数解析（multipart form-data）----
+      const prompt = typeof request.body?.prompt === 'string' ? request.body.prompt.trim() : '';
+      if (!prompt) return new Response({ error: '视频提示词不能为空' }, { statusCode: 400 });
+
+      const selectedModel = typeof request.body?.model === 'string' && request.body.model.trim()
+        ? request.body.model.trim()
+        : DEFAULT_DOUBAO_VIDEO_MODEL;
+      const useDoubao = isDoubaoVideoModel(selectedModel);
+      const provider = useDoubao ? 'doubao' : 'jimeng';
+
+      const duration = Number(request.body?.duration);
+      const finalDuration = useDoubao
+        ? (duration >= 8 ? 10 : 5)
+        : (Number.isInteger(duration) && duration >= 4 && duration <= 15 ? duration : 5);
+
+      const allowedRatios = useDoubao ? DOUBAO_RATIOS : STUDIO_RATIOS;
+      const ratio = typeof request.body?.ratio === 'string' && allowedRatios.includes(request.body.ratio)
+        ? request.body.ratio : '16:9';
+
+      const files: any = request.files || {};
+      const firstFile = files.first_frame || Object.values(files).find((f: any) => f?.fieldname === 'first_frame');
+      const lastFile = files.last_frame || Object.values(files).find((f: any) => f?.fieldname === 'last_frame');
+      if (lastFile?.filepath && !firstFile?.filepath) {
+        return new Response({ error: '上传尾帧时请先上传首帧参考图' }, { statusCode: 400 });
+      }
+
+      const toDataUri = (file: any): string | null => {
+        try {
+          const buf = fs.readFileSync(file.filepath);
+          const type = file.mimetype || file.type || mime.getType(file.originalFilename || file.newFilename || '') || 'image/png';
+          return `data:${type};base64,${buf.toString('base64')}`;
+        } catch (e: any) {
+          logger.error(`读取上传参考图失败: ${e.message}`);
+          return null;
+        }
+      };
+
+      const filePaths: string[] = [];
+      if (firstFile?.filepath) {
+        const firstDataUri = toDataUri(firstFile);
+        if (!firstDataUri) return new Response({ error: '首帧参考图读取失败' }, { statusCode: 400 });
+        filePaths.push(firstDataUri);
+      }
+      if (!useDoubao && lastFile?.filepath) {
+        const lastDataUri = toDataUri(lastFile);
+        if (lastDataUri) filePaths.push(lastDataUri);
+      }
+
+      // ---- 账号池多账号故障切换生成 ----
+      const startedAt = Date.now();
+      let videoUrl: string;
+      let accountName = '';
+      try {
+        const outcome = await executeWithPoolFailover(provider, (cred) =>
+          useDoubao
+            ? generateDoubaoVideo(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths }, cred.token)
+            : generateVideoWithRetry(selectedModel, prompt, { ratio, resolution: '720p', duration: finalDuration, filePaths }, cred.token)
+        );
+        videoUrl = outcome.result;
+        accountName = outcome.credential.accountName || '';
+      } catch (e: any) {
+        const msg = String(e?.message || '视频生成失败');
+        if (msg.includes('没有可用的')) {
+          return new Response(
+            { error: `账号池无可用${useDoubao ? '豆包' : '即梦'}账号，请先在「账号池」添加并启用${useDoubao ? '豆包' : '即梦'}账号` },
+            { statusCode: 503 }
+          );
+        }
+        logger.error(`视频创作页生成失败 (${selectedModel}): ${msg}`);
+        return new Response({ error: msg }, { statusCode: 502 });
+      }
+
+      // ---- 统计与媒体落库（复用媒体资源页）----
+      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+      const statsTag = `studio:${accountName || selectedModel}`;
+      try {
+        db.recordCall(statsTag, selectedModel, 0);
+        if (videoUrl) db.saveMedia('video', videoUrl, selectedModel, prompt, statsTag);
+      } catch (e: any) {
+        logger.warn(`视频创作统计落库失败: ${e.message}`);
+      }
+
+      return {
+        video_url: videoUrl,
+        model: selectedModel,
+        provider,
+        account_name: accountName,
+        duration: finalDuration,
+        ratio,
+        elapsed_seconds: elapsedSeconds
+      };
     }
   },
   delete: {

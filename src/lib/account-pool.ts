@@ -4,15 +4,18 @@ import fs from "fs-extra";
 import path from "path";
 
 import { getCredit, request } from "@/api/controllers/core.ts";
+import { getDoubaoAccountStatus } from "@/api/controllers/doubao-videos.ts";
 
 const DB_PATH = process.env.DB_PATH || "./data/jimeng.db";
 const TABLE = "jimeng_accounts";
 
+export type AccountProvider = "jimeng" | "doubao";
 export type AccountCredentialKind = "cookie" | "sessionid";
 export type AccountSelectionStrategy = "round_robin" | "least_failures";
 
 export interface AccountPoolCreateInput {
   name: string;
+  provider?: AccountProvider;
   cookie?: string;
   sessionId?: string;
   enabled?: boolean;
@@ -21,6 +24,7 @@ export interface AccountPoolCreateInput {
 
 export interface AccountPoolUpdateInput {
   name?: string;
+  provider?: AccountProvider;
   cookie?: string;
   sessionId?: string;
   enabled?: boolean;
@@ -40,6 +44,7 @@ export interface AccountStatus {
 export interface PublicAccount {
   id: string;
   name: string;
+  provider: AccountProvider;
   credentialKind: AccountCredentialKind;
   credentialPreview: string;
   enabled: boolean;
@@ -57,7 +62,7 @@ export interface PublicAccount {
 
 export interface AccountSelection {
   account: PublicAccount;
-  /** Internal use by the caller that performs a Jimeng request. Never return this from an HTTP handler. */
+  /** Internal use by the caller that performs an upstream request. Never return this from an HTTP handler. */
   credential: string;
   sessionId: string;
 }
@@ -67,6 +72,7 @@ export type MembershipStatusProvider = (sessionId: string, account: PublicAccoun
 interface AccountRow {
   id: string;
   name: string;
+  provider?: string;
   credential_kind: AccountCredentialKind;
   credential_hash: string;
   credential_ciphertext: string;
@@ -160,8 +166,13 @@ function decrypt(value: string): string {
   return Buffer.concat([decipher.update(Buffer.from(ciphertextText, "base64url")), decipher.final()]).toString("utf8");
 }
 
-function hashCredential(value: string): string {
-  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+function normalizeProvider(provider?: string): AccountProvider {
+  return provider === "doubao" ? "doubao" : "jimeng";
+}
+
+function hashCredential(value: string, provider: AccountProvider = "jimeng"): string {
+  const input = provider === "doubao" ? `doubao:${value}` : value;
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
 }
 
 function credentialInput(input: AccountPoolCreateInput | AccountPoolUpdateInput): { value: string; kind: AccountCredentialKind } | null {
@@ -179,6 +190,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS ${TABLE} (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'jimeng',
     credential_kind TEXT NOT NULL CHECK (credential_kind IN ('cookie', 'sessionid')),
     credential_hash TEXT NOT NULL UNIQUE,
     credential_ciphertext TEXT NOT NULL,
@@ -203,13 +215,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_${TABLE}_eligible ON ${TABLE}(enabled, cooldown_until, failure_count);
 `);
 
-let roundRobinCursor = 0;
+const existingCols = db.pragma(`table_info(${TABLE})`) as Array<{ name: string }>;
+if (!existingCols.some((c) => c.name === "provider")) {
+  db.exec(`ALTER TABLE ${TABLE} ADD COLUMN provider TEXT NOT NULL DEFAULT 'jimeng'`);
+}
+
+const roundRobinCursor: Record<AccountProvider, number> = { jimeng: 0, doubao: 0 };
 let membershipStatusProvider: MembershipStatusProvider | undefined;
 
 function toPublic(row: AccountRow): PublicAccount {
   return {
     id: row.id,
     name: row.name,
+    provider: normalizeProvider(row.provider),
     credentialKind: row.credential_kind,
     credentialPreview: row.credential_kind === "cookie" ? "cookie:********" : preview(row.credential_hash),
     enabled: Boolean(row.enabled),
@@ -244,8 +262,11 @@ export function setMembershipStatusProvider(provider?: MembershipStatusProvider)
   membershipStatusProvider = provider;
 }
 
-export function listAccounts(): PublicAccount[] {
-  return (db.prepare(`SELECT * FROM ${TABLE} ORDER BY created_at ASC`).all() as AccountRow[]).map(toPublic);
+export function listAccounts(provider?: AccountProvider): PublicAccount[] {
+  const rows = provider
+    ? (db.prepare(`SELECT * FROM ${TABLE} WHERE provider = ? ORDER BY created_at ASC`).all(normalizeProvider(provider)) as AccountRow[])
+    : (db.prepare(`SELECT * FROM ${TABLE} ORDER BY created_at ASC`).all() as AccountRow[]);
+  return rows.map(toPublic);
 }
 
 export function getAccount(id: string): PublicAccount {
@@ -254,14 +275,15 @@ export function getAccount(id: string): PublicAccount {
 
 export function createAccount(input: AccountPoolCreateInput): PublicAccount {
   if (!input.name?.trim()) throw new Error("账号名称不能为空");
+  const provider = normalizeProvider(input.provider);
   const credential = credentialInput(input);
   if (!credential) throw new Error("必须提供 cookie 或 sessionId");
   extractSessionId(credential.value, credential.kind);
   const timestamp = now();
   const id = crypto.randomUUID();
   try {
-    db.prepare(`INSERT INTO ${TABLE} (id, name, credential_kind, credential_hash, credential_ciphertext, enabled, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      id, input.name.trim(), credential.kind, hashCredential(credential.value), encrypt(credential.value), input.enabled === false ? 0 : 1,
+    db.prepare(`INSERT INTO ${TABLE} (id, name, provider, credential_kind, credential_hash, credential_ciphertext, enabled, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      id, input.name.trim(), provider, credential.kind, hashCredential(credential.value, provider), encrypt(credential.value), input.enabled === false ? 0 : 1,
       JSON.stringify(input.metadata || {}), timestamp, timestamp
     );
   } catch (error: any) {
@@ -275,19 +297,21 @@ export function updateAccount(id: string, input: AccountPoolUpdateInput): Public
   const row = getRow(id);
   const credential = credentialInput(input);
   if (credential) { extractSessionId(credential.value, credential.kind); }
+  const provider = input.provider === undefined ? normalizeProvider(row.provider) : normalizeProvider(input.provider);
   const timestamp = now();
   const values = {
     name: input.name === undefined ? row.name : input.name.trim(),
+    provider,
     enabled: input.enabled === undefined ? row.enabled : (input.enabled ? 1 : 0),
     metadata: input.metadata === undefined ? row.metadata_json : JSON.stringify(input.metadata),
     kind: credential?.kind || row.credential_kind,
-    hash: credential ? hashCredential(credential.value) : row.credential_hash,
+    hash: credential ? hashCredential(credential.value, provider) : row.credential_hash,
     ciphertext: credential ? encrypt(credential.value) : row.credential_ciphertext
   };
   if (!values.name) throw new Error("账号名称不能为空");
   try {
-    db.prepare(`UPDATE ${TABLE} SET name = ?, credential_kind = ?, credential_hash = ?, credential_ciphertext = ?, enabled = ?, metadata_json = ?, updated_at = ? WHERE id = ?`).run(
-      values.name, values.kind, values.hash, values.ciphertext, values.enabled, values.metadata, timestamp, id
+    db.prepare(`UPDATE ${TABLE} SET name = ?, provider = ?, credential_kind = ?, credential_hash = ?, credential_ciphertext = ?, enabled = ?, metadata_json = ?, updated_at = ? WHERE id = ?`).run(
+      values.name, values.provider, values.kind, values.hash, values.ciphertext, values.enabled, values.metadata, timestamp, id
     );
   } catch (error: any) {
     if (String(error?.message).includes("UNIQUE")) throw new Error("该账号凭据已存在");
@@ -307,13 +331,29 @@ export function setAccountEnabled(id: string, enabled: boolean): PublicAccount {
   return getAccount(id);
 }
 
-export function selectAccount(strategy: AccountSelectionStrategy = "least_failures"): AccountSelection {
-  const rows = db.prepare(`SELECT * FROM ${TABLE} WHERE enabled = 1 AND (cooldown_until IS NULL OR cooldown_until <= ?) ORDER BY failure_count ASC, last_used_at ASC`).all(now()) as AccountRow[];
-  if (!rows.length) throw new Error("没有可用的即梦账号");
-  const row = strategy === "round_robin" ? rows[roundRobinCursor++ % rows.length] : rows[0];
+export function selectAccount(
+  strategy: AccountSelectionStrategy = "least_failures",
+  options: { provider?: AccountProvider; excludeIds?: string[] } = {}
+): AccountSelection {
+  const provider = normalizeProvider(options.provider);
+  const exclude = new Set(options.excludeIds || []);
+  const rows = (db
+    .prepare(
+      `SELECT * FROM ${TABLE} WHERE provider = ? AND enabled = 1 AND (cooldown_until IS NULL OR cooldown_until <= ?) ORDER BY failure_count ASC, last_used_at ASC`
+    )
+    .all(provider, now()) as AccountRow[]).filter((r) => !exclude.has(r.id));
+  if (!rows.length) {
+    throw new Error(provider === "doubao" ? "没有可用的豆包账号" : "没有可用的即梦账号");
+  }
+  const row =
+    strategy === "round_robin"
+      ? rows[roundRobinCursor[provider]++ % rows.length]
+      : rows[0];
   db.prepare(`UPDATE ${TABLE} SET last_used_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), row.id);
-  const credential = decrypt(row.credential_ciphertext);
-  return { account: getAccount(row.id), credential, sessionId: extractSessionId(credential, row.credential_kind) };
+  const raw = decrypt(row.credential_ciphertext);
+  const sessionId = extractSessionId(raw, row.credential_kind);
+  const credential = row.credential_kind === "sessionid" ? `sessionid=${sessionId}` : raw;
+  return { account: getAccount(row.id), credential, sessionId };
 }
 
 export function markSuccess(id: string): PublicAccount {
@@ -331,12 +371,20 @@ export function markFailure(id: string, cooldownMs = 30_000): PublicAccount {
 
 export async function refreshStatus(id: string): Promise<PublicAccount> {
   const row = getRow(id);
-  const credential = decrypt(row.credential_ciphertext);
-  const sessionId = extractSessionId(credential, row.credential_kind);
+  const raw = decrypt(row.credential_ciphertext);
+  const sessionId = extractSessionId(raw, row.credential_kind);
+  const provider = normalizeProvider(row.provider);
   try {
+    const timestamp = now();
+    if (provider === "doubao") {
+      const status = await getDoubaoAccountStatus(row.credential_kind === "sessionid" ? `sessionid=${sessionId}` : raw);
+      db.prepare(`UPDATE ${TABLE} SET free_credit = ?, purchase_credit = NULL, vip_credit = NULL, total_credit = ?, membership_json = ?, status_checked_at = ?, status_error = NULL, updated_at = ? WHERE id = ?`).run(
+        status.freeCredit, status.totalCredit, JSON.stringify(status.membership), timestamp, timestamp, id
+      );
+      return getAccount(id);
+    }
     const credit = await getCredit(sessionId);
     const membership = membershipStatusProvider ? await membershipStatusProvider(sessionId, toPublic(row)) : "unknown";
-    const timestamp = now();
     db.prepare(`UPDATE ${TABLE} SET free_credit = ?, purchase_credit = ?, vip_credit = ?, total_credit = ?, membership_json = ?, status_checked_at = ?, status_error = NULL, updated_at = ? WHERE id = ?`).run(
       credit.giftCredit ?? null, credit.purchaseCredit ?? null, credit.vipCredit ?? null, credit.totalCredit ?? null, JSON.stringify(membership), timestamp, timestamp, id
     );

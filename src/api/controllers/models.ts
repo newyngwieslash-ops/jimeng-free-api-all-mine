@@ -1,5 +1,6 @@
 import logger from "@/lib/logger.ts";
 import util from "@/lib/util.ts";
+import { DOUBAO_VIDEO_MODELS } from "./doubao-videos.ts";
 import { request } from "./core.ts";
 
 export type JimengModelType = "image" | "video";
@@ -367,8 +368,23 @@ function cloneModelConfig(model: JimengModelConfig): JimengModelConfig {
   };
 }
 
+const STATIC_DOUBAO_VIDEO_MODELS: JimengModelConfig[] = DOUBAO_VIDEO_MODELS.map((m) => ({
+  id: m.id,
+  type: "video",
+  name: m.name,
+  description: m.description,
+  modelReqKey: m.upstream,
+  aliases: [...m.aliases],
+  defaultResolution: "720p",
+  supportedResolutions: ["720p"],
+  supportsLongDuration: true,
+  defaultDuration: 5,
+  supportedDurations: [5, 10],
+  source: "static",
+}));
+
 export function getStaticModelConfigs(type?: JimengModelType) {
-  const models = [...STATIC_IMAGE_MODELS, ...STATIC_VIDEO_MODELS];
+  const models = [...STATIC_DOUBAO_VIDEO_MODELS, ...STATIC_IMAGE_MODELS, ...STATIC_VIDEO_MODELS];
   return models
     .filter((model) => !type || model.type === type)
     .map(cloneModelConfig);
@@ -717,7 +733,7 @@ function mergeModelConfigs(staticModels: JimengModelConfig[], dynamicModels: Jim
   for (const model of staticModels) {
     const cloned = cloneModelConfig(model);
     byReqKey.set(`${cloned.type}:${cloned.modelReqKey}`, cloned);
-    if (dynamicModels.length === 0 || !dynamicTypes.has(model.type)) {
+    if (cloned.id.startsWith("doubao-") || dynamicModels.length === 0 || !dynamicTypes.has(cloned.type)) {
       byId.set(cloned.id, cloned);
     }
   }
@@ -798,7 +814,7 @@ export function toOpenAIModel(model: JimengModelConfig) {
   return {
     id: model.id,
     object: "model",
-    owned_by: `jimeng-${model.type}`,
+    owned_by: model.id.startsWith("doubao-") ? `doubao-${model.type}` : `jimeng-${model.type}`,
     description: model.description,
     name: model.name,
     model_req_key: model.modelReqKey,
