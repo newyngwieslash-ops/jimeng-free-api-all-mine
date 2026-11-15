@@ -384,6 +384,8 @@ async function main() {
   const fileRes = await fetch(localVideoUrl);
   assert.equal(fileRes.status, 200);
   assert.ok((fileRes.headers.get("content-type") || "").includes("video/mp4"));
+  assert.equal(fileRes.headers.get("cache-control"), "no-cache");
+  assert.ok(fileRes.headers.get("etag"));
   assert.deepEqual(Buffer.from(await fileRes.arrayBuffer()), fakeMp4Bytes);
   assert.equal(fallbackApiCalled, true);
   assert.equal(confirmCalled, true);

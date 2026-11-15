@@ -41,7 +41,9 @@ export default {
             const stat = await fs.stat(filePath);
             const headers: Record<string, string> = {
                 'Accept-Ranges': 'bytes',
-                'Cache-Control': 'public, max-age=86400'
+                'Cache-Control': 'no-cache',
+                'ETag': `"${stat.size.toString(16)}-${Math.trunc(stat.mtimeMs).toString(16)}"`,
+                'Last-Modified': stat.mtime.toUTCString()
             };
             if (request.query?.download === '1') {
                 headers['Content-Disposition'] = `attachment; filename="${filename}"`;
